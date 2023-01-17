@@ -4,6 +4,7 @@
 import argparse
 import asyncio
 import collections
+import itertools
 import json
 import logging
 import os
@@ -134,6 +135,8 @@ class UpsMonit:
         self.last_bat_report = 0
         self.last_norm_report = 0
         self.last_cmd_status = 0
+        self.event_log_deque = collections.deque([], 5_000)
+        self.log_report_len = 20
 
     def argparser(self):
         parser = argparse.ArgumentParser(description='UPS monitoring')
@@ -220,15 +223,19 @@ class UpsMonit:
 
     def init_bot(self):
         self.bot_app = ApplicationBuilder().token(self.bot_apikey).build()
+        help_handler = CommandHandler('help', self.bot_cmd_help)
         start_handler = CommandHandler('start', self.bot_cmd_start)
         stop_handler = CommandHandler('stop', self.bot_cmd_stop)
         status_handler = CommandHandler('status', self.bot_cmd_status)
         full_status_handler = CommandHandler('full_status', self.bot_cmd_full_status)
+        log_handler = CommandHandler('log', self.bot_cmd_log)
+        self.bot_app.add_handler(help_handler)
         self.bot_app.add_handler(start_handler)
         self.bot_app.add_handler(stop_handler)
         self.bot_app.add_handler(stop_handler)
         self.bot_app.add_handler(status_handler)
         self.bot_app.add_handler(full_status_handler)
+        self.bot_app.add_handler(log_handler)
 
     def load_bot_thread(self):
         """Running bot in a separate thread. Experimental method.
@@ -542,6 +549,17 @@ class UpsMonit:
             return False
         return True
 
+    async def bot_cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        help_txt = "Help: \n" + "\n".join([
+            '/start - register',
+            '/stop - deregister',
+            '/status - brief status',
+            '/full_status - full status',
+            '/log - log',
+        ])
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=help_txt)
+        self.registered_chat_ids_set.add(update.effective_chat.id)
+
     async def bot_cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self.check_user("start", update, context):
             return
@@ -577,6 +595,24 @@ class UpsMonit:
         logger.info(f"Sending status response with age {status_age} s: {self.last_ups_status}")
         await context.bot.send_message(chat_id=update.effective_chat.id,
                                        text=f"Status: {json.dumps(r, indent=2)}, {'%.2f' % status_age} s old")
+
+    async def bot_cmd_log(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self.check_user("log", update, context):
+            return
+
+        def _txt_log(r):
+            if isinstance(r['msg'], str):
+                rr = dict(r)
+                del rr['msg']
+                return f'{json.dumps(rr, indent=2)}, msg: {r["msg"]}'
+            return json.dumps(r, indent=2)
+
+        last_log = list(itertools.islice(reversed(self.event_log_deque), self.log_report_len))
+
+        last_log_txt = [f' - {_txt_log(x)}' % x for x in last_log]
+        last_log_txt = "\n".join(last_log_txt)
+        log_msg = f'Last {self.log_report_len} log reports: \n{last_log_txt}'
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=log_msg)
 
     async def event_handler(self):
         notif_type = os.getenv('NOTIFYTYPE')
@@ -656,6 +692,17 @@ class UpsMonit:
             except Exception as e:
                 logger.warning(f'Exception in processing server fifo: {e}', exc_info=e)
 
+    def add_log(self, msg, mtype='-'):
+        time_fmt = datetime.now().strftime("%m/%d/%Y, %H:%M:%S")
+        time_now = time.time()
+
+        self.event_log_deque.append({
+            'time': time_now,
+            'time_fmt': time_fmt,
+            'mtype': mtype,
+            'msg': msg
+        })
+
     def on_ups_event(self, js):
         self.status_thread_last_check = 0
 
@@ -668,6 +715,7 @@ class UpsMonit:
         msg = f'UPS event: {notif}, message: {msg}, status: {status}'
         logger.info(msg)
 
+        self.add_log(msg, mtype='ups-event')
         self.send_telegram_notif_on_main(msg)
 
     def on_new_ups_state(self, r):
@@ -683,6 +731,10 @@ class UpsMonit:
             self.last_ups_status_change = t
             self.is_on_bat = is_on_bat
             do_report = True
+
+            status = json.dumps(self.shorten_status(self.last_ups_status) or {}, indent=2)
+            msg = f'UPS state report [is_online={is_online}, age={"%.2f" % (t - self.last_bat_report)}]: {status}'
+            self.add_log(msg, mtype='ups-change')
 
         if self.is_on_bat:
             t_diff = t - self.last_bat_report
