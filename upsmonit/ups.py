@@ -467,6 +467,9 @@ class UpsMonit:
         return True
 
     async def bot_cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self.check_user("help", update, context):
+            return
+
         help_txt = "Help: \n" + "\n".join([
             '/start - register',
             '/stop - deregister',
@@ -475,7 +478,6 @@ class UpsMonit:
             '/log - log',
         ])
         await context.bot.send_message(chat_id=update.effective_chat.id, text=help_txt)
-        self.registered_chat_ids_set.add(update.effective_chat.id)
 
     async def bot_cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self.check_user("start", update, context):

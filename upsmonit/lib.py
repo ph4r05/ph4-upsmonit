@@ -24,6 +24,7 @@ from ph4runner import AsyncRunner
 
 logger = logging.getLogger(__name__)
 
+
 def try_fnc(fnc):
     try:
         return fnc()
