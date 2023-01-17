@@ -16,8 +16,13 @@ import socket
 import socketserver
 import threading
 import time
+import smtplib
+import ssl
 from datetime import datetime
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from queue import Queue
+from typing import List
 
 import coloredlogs
 import jwt
@@ -106,6 +111,12 @@ class UpsMonit:
         self.server_fifo = None
         self.server_port = None
         self.server_host = '127.0.0.1'
+        self.email_server = None
+        self.email_user = None
+        self.email_pass = None
+        self.email_port = 587
+        self.email_timeout = 20.0
+        self.email_notif_recipients = []
         self.allowed_usernames = []
         self.allowed_userids = []
         self.registered_chat_ids = []
@@ -117,6 +128,8 @@ class UpsMonit:
 
         self.task_queue = Queue()
         self.is_running = True
+        self.worker_thread = None
+        self.worker_queue = Queue()
         self.status_thread = None
         self.status_thread_last_check = 0
         self.last_ups_status = None
@@ -137,7 +150,7 @@ class UpsMonit:
         self.last_norm_report = 0
         self.last_cmd_status = 0
         self.event_log_deque = collections.deque([], 5_000)
-        self.log_report_len = 20
+        self.log_report_len = 7
 
     def argparser(self):
         parser = argparse.ArgumentParser(description='UPS monitoring')
@@ -208,6 +221,14 @@ class UpsMonit:
             registered_chat_ids = jsonpath('$.registered_chat_ids', self.config, True)
             if registered_chat_ids:
                 self.registered_chat_ids += registered_chat_ids
+
+            email_notif_recipients = jsonpath('$.email_notif_recipients', self.config, True)
+            if email_notif_recipients:
+                self.email_notif_recipients += email_notif_recipients
+
+            self.email_server = jsonpath('$.email_server', self.config, True)
+            self.email_user = jsonpath('$.email_user', self.config, True)
+            self.email_pass = jsonpath('$.email_pass', self.config, True)
 
         except Exception as e:
             logger.error("Could not load config %s at %s" % (e, self.args.config), exc_info=e)
@@ -342,6 +363,26 @@ class UpsMonit:
 
         except Exception as e:
             logger.warning(f'Exception in closing the bot {e}', exc_info=e)
+
+    def start_worker_thread(self):
+        def worker_internal():
+            logger.info(f'Starting worker thread')
+            while self.is_running:
+                try:
+                    next_task = self.worker_queue.get(False)
+                    if not next_task:
+                        time.sleep(0.02)
+                    try:
+                        next_task()
+                    except Exception as e:
+                        logger.error(f'Top-level error at worker thread {e}', exc_info=e)
+                except queue.Empty:
+                    time.sleep(0.02)
+            logger.info(f'Stopping worker thread')
+
+        self.worker_thread = threading.Thread(target=worker_internal, args=())
+        self.worker_thread.daemon = False
+        self.worker_thread.start()
 
     def start_status_thread(self):
         def status_internal():
@@ -502,6 +543,7 @@ class UpsMonit:
                 raise Exception('UPS name to monitor is not defined')
 
             self.init_signals()
+            self.start_worker_thread()
             self.start_status_thread()
             if self.use_fifo:
                 self.start_fifo_thread()
@@ -715,6 +757,7 @@ class UpsMonit:
 
         self.add_log(msg, mtype='ups-event')
         self.send_telegram_notif_on_main(msg)
+        self.notify_via_email_async(msg, f'UPS event {datetime.now().strftime("%m/%d/%Y, %H:%M:%S")}')
 
     def on_new_ups_state(self, r):
         """
@@ -730,6 +773,7 @@ class UpsMonit:
         is_on_bat = not is_online and not is_charging  # simplification
 
         do_report = False
+        in_state_report = False
         if self.last_ups_state_txt != ups_state:
             old_state_change = self.last_ups_status_change
             logger.info(f'Detected UPS change detected {ups_state}, last state change: {t - old_state_change}')
@@ -745,15 +789,16 @@ class UpsMonit:
         if self.is_on_bat:
             t_diff = t - self.last_bat_report
             is_fast = self.last_bat_report == 0 or t_diff < 5 * 60
-            do_report |= (is_fast and t_diff >= self.report_interval_fast) or \
-                         (not is_fast and t_diff >= self.report_interval_slow)
+            in_state_report = (is_fast and t_diff >= self.report_interval_fast) or \
+                              (not is_fast and t_diff >= self.report_interval_slow)
 
-        if do_report:
+        if do_report or in_state_report:
             t_diff = t - self.last_ups_status_change
             status = json.dumps(self.shorten_status(self.last_ups_status) or {}, indent=2)
-            self.send_telegram_notif_on_main(
-                f'UPS state report [{ups_state}, age={"%.2f" % t_diff}]: {status}'
-            )
+            txt_msg = f'UPS state report [{ups_state}, age={"%.2f" % t_diff}]: {status}'
+            self.send_telegram_notif_on_main(txt_msg)
+            if do_report:
+                self.notify_via_email_async(txt_msg, f'UPS state change {datetime.now().strftime("%m/%d/%Y, %H:%M:%S")}')
             self.last_bat_report = t
 
     def get_ups_state(self):
@@ -765,8 +810,48 @@ class UpsMonit:
         ret = parse_ups(out)
         return ret
 
-    def _get_tuple(self, key, dict):
-        return key, dict[key]
+    def notify_via_email_async(self, txt_message: str, subject: str):
+        self.worker_queue.put(lambda: self.notify_via_email(txt_message, subject))
+
+    def notify_via_email(self, txt_message: str, subject: str):
+        if not self.email_notif_recipients:
+            return
+        return self.send_notify_email(self.email_notif_recipients, txt_message, subject)
+
+    def send_notify_email(self, recipients: List[str], txt_message: str, subject: str):
+        if not self.email_server or not self.email_user or not self.email_pass:
+            return
+
+        server = None
+        context = ssl.create_default_context()
+
+        try:
+            logger.info(f'Sending email notification via {self.email_user}, msg: {txt_message[:80]}...')
+            server = smtplib.SMTP(self.email_server, self.email_port, timeout=self.email_timeout)
+            server.ehlo()
+            server.starttls(context=context)
+            server.ehlo()
+            server.login(self.email_user, self.email_pass)
+
+            for recipient in recipients:
+                message = MIMEMultipart("alternative")
+                message["Subject"] = subject
+                message["From"] = self.email_user
+                message["To"] = recipient
+                part1 = MIMEText(txt_message, "plain")
+                message.attach(part1)
+                server.sendmail(self.email_user, recipient, message.as_string())
+            return True
+
+        except Exception as e:
+            logger.warning(f'Exception when sending email {e}', exc_info=e)
+            return e
+
+        finally:
+            try_fnc(lambda: server.quit())
+
+    def _get_tuple(self, key, dct):
+        return key, dct[key]
 
     def shorten_status(self, status):
         if not status:
