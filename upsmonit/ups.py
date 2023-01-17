@@ -9,19 +9,10 @@ import json
 import logging
 import os
 import platform
-import queue
-import select
 import signal
-import socket
-import socketserver
 import threading
 import time
-import smtplib
-import ssl
 from datetime import datetime
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from queue import Queue
 from typing import List
 
 import coloredlogs
@@ -31,6 +22,8 @@ from ph4runner import AsyncRunner, install_sarge_filter
 from telegram import Update, User
 from telegram.error import TelegramError
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler
+
+from upsmonit.lib import Worker, AsyncWorker, FiFoComm, TcpComm, NotifyEmail
 
 logger = logging.getLogger(__name__)
 coloredlogs.install(level=logging.INFO)
@@ -108,14 +101,7 @@ class UpsMonit:
         self.config = {}
         self.jwt_key = None
         self.bot_apikey = None
-        self.server_fifo = None
-        self.server_port = None
-        self.server_host = '127.0.0.1'
-        self.email_server = None
-        self.email_user = None
-        self.email_pass = None
-        self.email_port = 587
-        self.email_timeout = 20.0
+
         self.email_notif_recipients = []
         self.allowed_usernames = []
         self.allowed_userids = []
@@ -126,17 +112,18 @@ class UpsMonit:
         self.report_interval_fast = 20
         self.report_interval_slow = 5 * 60
 
-        self.task_queue = Queue()
         self.is_running = True
-        self.worker_thread = None
-        self.worker_queue = Queue()
+        self.worker = Worker(running_fnc=lambda: self.is_running)
+        self.asyncWorker = AsyncWorker(running_fnc=lambda: self.is_running)
+        self.fifo_comm = FiFoComm(handler=self.process_fifo_data, running_fnc=lambda: self.is_running)
+        self.tcp_comm = TcpComm(handler=self.process_server_data, running_fnc=lambda: self.is_running)
+        self.notifier_email = NotifyEmail()
+
         self.status_thread = None
         self.status_thread_last_check = 0
         self.last_ups_status = None
         self.last_ups_status_time = 0
-        self.fifo_thread = None
-        self.server_thread = None
-        self.server_tcp = None
+
         self.main_loop = None
         self.start_error = None
 
@@ -203,12 +190,12 @@ class UpsMonit:
                 self.ups_name = ups_name
 
             server_port = jsonpath('$.server_port', self.config, True)
-            if not self.server_port:
-                self.server_port = server_port
+            if not self.tcp_comm.server_port:
+                self.tcp_comm.server_port = server_port
 
             server_fifo = jsonpath('$.server_fifo', self.config, True)
-            if not self.server_fifo:
-                self.server_fifo = server_fifo
+            if not self.fifo_comm.fifo_path:
+                self.fifo_comm.fifo_path = server_fifo
 
             allowed_usernames = jsonpath('$.allowed_usernames', self.config, True)
             if allowed_usernames:
@@ -226,9 +213,9 @@ class UpsMonit:
             if email_notif_recipients:
                 self.email_notif_recipients += email_notif_recipients
 
-            self.email_server = jsonpath('$.email_server', self.config, True)
-            self.email_user = jsonpath('$.email_user', self.config, True)
-            self.email_pass = jsonpath('$.email_pass', self.config, True)
+            self.notifier_email.server = jsonpath('$.email_server', self.config, True)
+            self.notifier_email.user = jsonpath('$.email_user', self.config, True)
+            self.notifier_email.passwd = jsonpath('$.email_pass', self.config, True)
 
         except Exception as e:
             logger.error("Could not load config %s at %s" % (e, self.args.config), exc_info=e)
@@ -365,24 +352,7 @@ class UpsMonit:
             logger.warning(f'Exception in closing the bot {e}', exc_info=e)
 
     def start_worker_thread(self):
-        def worker_internal():
-            logger.info(f'Starting worker thread')
-            while self.is_running:
-                try:
-                    next_task = self.worker_queue.get(False)
-                    if not next_task:
-                        time.sleep(0.02)
-                    try:
-                        next_task()
-                    except Exception as e:
-                        logger.error(f'Top-level error at worker thread {e}', exc_info=e)
-                except queue.Empty:
-                    time.sleep(0.02)
-            logger.info(f'Stopping worker thread')
-
-        self.worker_thread = threading.Thread(target=worker_internal, args=())
-        self.worker_thread.daemon = False
-        self.worker_thread.start()
+        self.worker.start_worker_thread()
 
     def start_status_thread(self):
         def status_internal():
@@ -414,85 +384,14 @@ class UpsMonit:
         self.status_thread.daemon = False
         self.status_thread.start()
 
-    def start_fifo_thread(self):
-        def fifo_internal():
-            logger.info('Starting fifo thread')
-            try:
-                self.destroy_fifo()
-                self.create_fifo()
-                with open(self.server_fifo) as _:
-                    pass
-
-            except Exception as e:
-                logger.error(f'Error starting server fifo: {e}', exc_info=e)
-                self.start_error = e
-                return
-
-            with open(self.server_fifo) as fifo:
-                while self.is_running:
-                    try:
-                        select.select([fifo], [], [fifo])
-                        data = fifo.read()
-                        if not data:
-                            continue
-
-                        self.process_fifo_data(data)
-
-                    except Exception as e:
-                        logger.error(f'Fifo thread exception: {e}', exc_info=e)
-                        time.sleep(0.1)
-            logger.info('Stopping fifo thread')
-
-        self.fifo_thread = threading.Thread(target=fifo_internal, args=())
-        self.fifo_thread.daemon = False
-        self.fifo_thread.start()
+    def start_fifo_comm(self):
+        self.fifo_comm.start()
 
     def start_server(self):
-        monit = self
-
-        class TcpServerHandler(socketserver.BaseRequestHandler):
-            def handle(self):
-                try:
-                    data = self.request.recv(8192).strip()
-                    r = monit.process_server_data(data.decode())
-                    self.request.sendall(r)
-                except Exception as e:
-                    logger.warning(f'Exception processing server message {e}', exc_info=e)
-                    self.request.sendall(json.dumps({'response': 500}).encode())
-
-        def server_internal():
-            logger.info('Starting server thread')
-            try:
-                self.server_tcp = socketserver.TCPServer((self.server_host, self.server_port), TcpServerHandler)
-                self.server_tcp.allow_reuse_address = True
-                self.server_tcp.serve_forever()
-            except Exception as e:
-                self.start_error = e
-                logger.error(f'Error in starting server thread {e}', exc_info=e)
-            finally:
-                logger.info('Stopping server thread')
-
-        self.server_thread = threading.Thread(target=server_internal, args=())
-        self.server_thread.daemon = False
-        self.server_thread.start()
+        self.tcp_comm.start()
 
     def stop_server(self):
-        if self.server_tcp:
-            self.server_tcp.shutdown()
-
-    def create_fifo(self):
-        if not self.server_fifo:
-            return
-        os.mkfifo(self.server_fifo)
-
-    def destroy_fifo(self):
-        if not self.server_fifo:
-            return
-        try:
-            if os.path.exists(self.server_fifo):
-                os.unlink(self.server_fifo)
-        except Exception as e:
-            logger.warning(f'Error unlinking fifo {e}', exc_info=e)
+        self.tcp_comm.stop()
 
     def create_jwt(self, payload):
         return jwt.encode(payload=payload, key=self.jwt_key, algorithm="HS256")
@@ -513,8 +412,8 @@ class UpsMonit:
         self.allowed_usernames = self.args.users or []
         self.allowed_userids = self.args.user_ids or []
         self.registered_chat_ids = self.args.chat_ids or []
-        self.server_fifo = self.args.server_fifo
-        self.server_port = self.args.server_port
+        self.fifo_comm.fifo_path = self.args.server_fifo
+        self.tcp_comm.server_port = self.args.server_port
         self.main_loop = asyncio.get_event_loop()
 
         self.load_config()
@@ -546,7 +445,7 @@ class UpsMonit:
             self.start_worker_thread()
             self.start_status_thread()
             if self.use_fifo:
-                self.start_fifo_thread()
+                self.start_fifo_comm()
             if self.use_server:
                 self.start_server()
             await self.load_bot_async()
@@ -559,7 +458,7 @@ class UpsMonit:
 
         finally:
             if self.use_fifo:
-                try_fnc(lambda: self.destroy_fifo())
+                try_fnc(lambda: self.fifo_comm.stop())
             if self.use_server:
                 try_fnc(lambda: self.stop_server())
             await self.stop_bot()
@@ -662,14 +561,7 @@ class UpsMonit:
         self.send_daemon_message(payload)
 
     async def main_handler(self):
-        while self.is_running:
-            try:
-                next_task = self.task_queue.get(False)
-                if not next_task:
-                    await asyncio.sleep(0.01)
-                await next_task
-            except queue.Empty:
-                await asyncio.sleep(0.02)
+        await self.asyncWorker.work()
         logger.info(f'Main thread finishing')
 
     async def send_telegram_notif(self, notif):
@@ -679,7 +571,7 @@ class UpsMonit:
 
     def send_telegram_notif_on_main(self, notif):
         coro = self.send_telegram_notif(notif)
-        self.task_queue.put(coro)
+        self.asyncWorker.enqueue(coro)
 
     def send_daemon_message(self, payload):
         if self.use_server:
@@ -690,23 +582,10 @@ class UpsMonit:
             raise Exception('No connection method to the daemon')
 
     def send_fifo_msg(self, payload):
-        with open(self.server_fifo, 'w') as f:
-            token = self.create_jwt(payload)
-            f.write(token + '\n')
-            f.flush()
+        return self.fifo_comm.send_message(self.create_jwt(payload))
 
     def send_server_msg(self, payload):
-        tcp_client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            data = self.create_jwt(payload)
-            tcp_client.connect((self.server_host, self.server_port))
-            tcp_client.sendall((data + '\n').encode())
-
-            # Read data from the TCP server and close the connection
-            received = tcp_client.recv(8192).decode()
-            return received
-        finally:
-            tcp_client.close()
+        return self.tcp_comm.send_message(self.create_jwt(payload))
 
     def process_fifo_data(self, data):
         logger.debug(f'Data read from fifo: {data}, len: {len(data)}')
@@ -811,7 +690,7 @@ class UpsMonit:
         return ret
 
     def notify_via_email_async(self, txt_message: str, subject: str):
-        self.worker_queue.put(lambda: self.notify_via_email(txt_message, subject))
+        self.worker.enqueue(lambda: self.notify_via_email(txt_message, subject))
 
     def notify_via_email(self, txt_message: str, subject: str):
         if not self.email_notif_recipients:
@@ -819,36 +698,7 @@ class UpsMonit:
         return self.send_notify_email(self.email_notif_recipients, txt_message, subject)
 
     def send_notify_email(self, recipients: List[str], txt_message: str, subject: str):
-        if not self.email_server or not self.email_user or not self.email_pass:
-            return
-
-        server = None
-        context = ssl.create_default_context()
-
-        try:
-            logger.info(f'Sending email notification via {self.email_user}, msg: {txt_message[:80]}...')
-            server = smtplib.SMTP(self.email_server, self.email_port, timeout=self.email_timeout)
-            server.ehlo()
-            server.starttls(context=context)
-            server.ehlo()
-            server.login(self.email_user, self.email_pass)
-
-            for recipient in recipients:
-                message = MIMEMultipart("alternative")
-                message["Subject"] = subject
-                message["From"] = self.email_user
-                message["To"] = recipient
-                part1 = MIMEText(txt_message, "plain")
-                message.attach(part1)
-                server.sendmail(self.email_user, recipient, message.as_string())
-            return True
-
-        except Exception as e:
-            logger.warning(f'Exception when sending email {e}', exc_info=e)
-            return e
-
-        finally:
-            try_fnc(lambda: server.quit())
+        self.notifier_email.send_notify_email(recipients, txt_message, subject)
 
     def _get_tuple(self, key, dct):
         return key, dct[key]
