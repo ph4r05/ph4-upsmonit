@@ -16,6 +16,7 @@ install_requires = [
     'blessed',
     'requests',
     'jsonpath_ng',
+    'PyJWT==2.6.0',
     'python-telegram-bot',
 ]
 
