@@ -17,13 +17,12 @@ from typing import List
 
 import coloredlogs
 import jwt
-from jsonpath_ng import parse
-from ph4runner import AsyncRunner, install_sarge_filter
-from telegram import Update, User
-from telegram.error import TelegramError
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler
+from ph4runner import install_sarge_filter
+from telegram import Update
+from telegram.ext import ContextTypes, CommandHandler
 
 from upsmonit.lib import Worker, AsyncWorker, FiFoComm, TcpComm, NotifyEmail, jsonpath, try_fnc, get_runner
+from upsmonit.tbot import TelegramBot
 
 logger = logging.getLogger(__name__)
 coloredlogs.install(level=logging.INFO)
@@ -76,15 +75,8 @@ class UpsMonit:
         self.ups_name = 'servers'
         self.config = {}
         self.jwt_key = None
-        self.bot_apikey = None
 
         self.email_notif_recipients = []
-
-        self.allowed_usernames = []
-        self.allowed_userids = []
-        self.registered_chat_ids = []
-        self.registered_chat_ids_set = set()
-
         self.use_server = True
         self.use_fifo = False
         self.report_interval_fast = 20
@@ -96,6 +88,7 @@ class UpsMonit:
         self.fifo_comm = FiFoComm(handler=self.process_fifo_data, running_fnc=lambda: self.is_running)
         self.tcp_comm = TcpComm(handler=self.process_server_data, running_fnc=lambda: self.is_running)
         self.notifier_email = NotifyEmail()
+        self.notifier_telegram = TelegramBot()
 
         self.status_thread = None
         self.status_thread_last_check = 0
@@ -104,9 +97,6 @@ class UpsMonit:
 
         self.main_loop = None
         self.start_error = None
-
-        self.bot_app = None
-        self.bot_thread = None
 
         self.is_on_bat = False
         self.last_ups_state_txt = None
@@ -143,9 +133,9 @@ class UpsMonit:
         return parser
 
     def load_config(self):
-        self.bot_apikey = os.getenv('BOT_APIKEY', None)
-        self.jwt_key = os.getenv('JWT_KEY', None)
         self.ups_name = os.getenv('UPS_NAME', None) or self.args.ups_name
+        self.jwt_key = os.getenv('JWT_KEY', None)
+        self.notifier_telegram.bot_apikey = os.getenv('BOT_APIKEY', None)
 
         if not self.args.config:
             return
@@ -156,8 +146,8 @@ class UpsMonit:
                 self.config = json.loads(dt)
 
             bot_apikey = jsonpath('$.bot_apikey', self.config, True)
-            if not self.bot_apikey:
-                self.bot_apikey = bot_apikey
+            if not self.notifier_telegram.bot_apikey:
+                self.notifier_telegram.bot_apikey = bot_apikey
 
             jwt_key = jsonpath('$.jwt_key', self.config, True) or 'default-jwt-key-0x043719de'
             if not self.jwt_key:
@@ -177,15 +167,15 @@ class UpsMonit:
 
             allowed_usernames = jsonpath('$.allowed_usernames', self.config, True)
             if allowed_usernames:
-                self.allowed_usernames += allowed_usernames
+                self.notifier_telegram.allowed_usernames += allowed_usernames
 
             allowed_userids = jsonpath('$.allowed_userids', self.config, True)
             if allowed_userids:
-                self.allowed_userids += allowed_userids
+                self.notifier_telegram.allowed_userids += allowed_userids
 
             registered_chat_ids = jsonpath('$.registered_chat_ids', self.config, True)
             if registered_chat_ids:
-                self.registered_chat_ids += registered_chat_ids
+                self.notifier_telegram.registered_chat_ids += registered_chat_ids
 
             email_notif_recipients = jsonpath('$.email_notif_recipients', self.config, True)
             if email_notif_recipients:
@@ -209,125 +199,24 @@ class UpsMonit:
             loop.add_signal_handler(sig, self._stop_app_on_signal)
 
     def init_bot(self):
-        self.bot_app = ApplicationBuilder().token(self.bot_apikey).build()
-        help_handler = CommandHandler('help', self.bot_cmd_help)
-        start_handler = CommandHandler('start', self.bot_cmd_start)
-        stop_handler = CommandHandler('stop', self.bot_cmd_stop)
+        self.notifier_telegram.init_bot()
+        self.notifier_telegram.help_commands += [
+            '/status - brief status',
+            '/full_status - full status',
+            '/log - log',
+        ]
+
         status_handler = CommandHandler('status', self.bot_cmd_status)
         full_status_handler = CommandHandler('full_status', self.bot_cmd_full_status)
         log_handler = CommandHandler('log', self.bot_cmd_log)
-        self.bot_app.add_handler(help_handler)
-        self.bot_app.add_handler(start_handler)
-        self.bot_app.add_handler(stop_handler)
-        self.bot_app.add_handler(stop_handler)
-        self.bot_app.add_handler(status_handler)
-        self.bot_app.add_handler(full_status_handler)
-        self.bot_app.add_handler(log_handler)
+        self.notifier_telegram.add_handlers([status_handler, full_status_handler, log_handler])
 
-    def load_bot_thread(self):
-        """Running bot in a separate thread. Experimental method.
-        Message handling does not work"""
-        if not self.bot_apikey:
-            logger.info('Telegram bot API key not configured')
-            return
-
+    async def start_bot_async(self):
         self.init_bot()
-
-        def looper(loop):
-            logger.debug('Starting looper for loop %s' % (loop,))
-            asyncio.set_event_loop(loop)
-            loop.run_forever()
-
-        worker_loop = asyncio.new_event_loop()
-        worker_thread = threading.Thread(
-            target=looper, args=(worker_loop,)
-        )
-        worker_thread.daemon = True
-        worker_thread.start()
-
-        logger.info(f'Starting bot thread')
-
-        async def main_coro():
-            logger.info('Main bot coroutine started')
-            await self.bot_app.updater.start_polling()
-            logger.info('Main bot coroutine finished')
-
-        # r = asyncio.run_coroutine_threadsafe(main_coro(), worker_loop)
-        # logger.info(f'Bot coroutine submitted {r}')
-        loop = asyncio.new_event_loop()
-
-        def error_callback(exc: TelegramError) -> None:
-            logger.info(f'Error callback {exc}')
-            self.bot_app.create_task(self.bot_app.process_error(error=exc, update=None))
-
-        # This method does not support message handling for some reason
-        def bot_internal():
-            logger.info(f'Starting bot thread')
-            asyncio.set_event_loop(loop)
-
-            loop.run_until_complete(self.bot_app.initialize())
-            if self.bot_app.post_init:
-                loop.run_until_complete(self.bot_app.post_init(self.bot_app))
-            loop.run_until_complete(
-                self.bot_app.updater.start_polling(error_callback=error_callback)
-            )  # one of updater.start_webhook/polling
-
-            logger.info('Bot app start')
-            loop.run_until_complete(self.bot_app.start())
-            logger.info('Bot running forever')
-            loop.run_forever()
-            logger.info(f'Stopping bot thread')
-
-        self.bot_thread = threading.Thread(target=bot_internal, args=())
-        self.bot_thread.daemon = False
-        self.bot_thread.start()
-
-        if False:
-            self.bot_app.run_polling()
-
-    async def load_bot_async(self):
-        if not self.bot_apikey:
-            logger.warning('Telegram bot API key not configured')
-            return
-
-        def error_callback(exc: TelegramError) -> None:
-            logger.info(f'Error callback {exc}')
-            self.bot_app.create_task(self.bot_app.process_error(error=exc, update=None))
-
-        try:
-            self.init_bot()
-            await self.bot_app.initialize()
-            if self.bot_app.post_init:
-                await self.bot_app.post_init(self.bot_app)
-            await self.bot_app.updater.start_polling(error_callback=error_callback)
-
-            logger.info('Bot app start')
-            await self.bot_app.start()
-            logger.info('Bot started')
-
-        except Exception as e:
-            logger.error(f'Error starting telegram bot {e}', exc_info=e)
-            self.start_error = e
-            raise
+        await self.notifier_telegram.start_bot_async()
 
     async def stop_bot(self):
-        if not self.bot_app:
-            return
-
-        # We arrive here either by catching the exceptions above or if the loop gets stopped
-        logger.info(f'Stopping telegram bot')
-        try:
-            # Mypy doesn't know that we already check if updater is None
-            if self.bot_app.updater.running:  # type: ignore[union-attr]
-                await self.bot_app.updater.stop()  # type: ignore[union-attr]
-            if self.bot_app.running:
-                await self.bot_app.stop()
-            await self.bot_app.shutdown()
-            if self.bot_app.post_shutdown:
-                await self.bot_app.post_shutdown(self.bot_app)
-
-        except Exception as e:
-            logger.warning(f'Exception in closing the bot {e}', exc_info=e)
+        await self.notifier_telegram.stop_bot_async()
 
     def start_worker_thread(self):
         self.worker.start_worker_thread()
@@ -387,15 +276,15 @@ class UpsMonit:
             coloredlogs.install(level=logging.DEBUG)
 
         self.ups_name = self.args.ups_name
-        self.allowed_usernames = self.args.users or []
-        self.allowed_userids = self.args.user_ids or []
-        self.registered_chat_ids = self.args.chat_ids or []
+        self.notifier_telegram.allowed_usernames = self.args.users or []
+        self.notifier_telegram.allowed_userids = self.args.user_ids or []
+        self.notifier_telegram.registered_chat_ids = self.args.chat_ids or []
         self.fifo_comm.fifo_path = self.args.server_fifo
         self.tcp_comm.server_port = self.args.server_port
         self.main_loop = asyncio.get_event_loop()
 
         self.load_config()
-        self.registered_chat_ids_set = set(self.registered_chat_ids)
+        self.notifier_telegram.registered_chat_ids_set = set(self.notifier_telegram.registered_chat_ids)
 
         # Async switch
         try:
@@ -426,7 +315,7 @@ class UpsMonit:
                 self.start_fifo_comm()
             if self.use_server:
                 self.start_server()
-            await self.load_bot_async()
+            await self.start_bot_async()
 
             if self.start_error:
                 logger.error(f'Cannot continue, start error: {self.start_error}')
@@ -443,82 +332,29 @@ class UpsMonit:
 
         return r
 
-    def is_user_allowed(self, user: User):
-        if not user:
-            return False
-
-        if user.id in self.allowed_userids:
-            return True
-
-        if user.username in self.allowed_usernames:
-            return True
-        return False
-
-    async def reject_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Fuck off")
-
-    async def check_user(self, method, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_allowed = self.is_user_allowed(update.message.from_user)
-        logger.info(f'New "{method}" message with chat_id: {update.effective_chat.id}, from {update.message.from_user}'
-                    f', allowed {user_allowed}')
-        if not user_allowed:
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Fuck off")
-            return False
-        return True
-
-    async def bot_cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self.check_user("help", update, context):
-            return
-
-        help_txt = "Help: \n" + "\n".join([
-            '/start - register',
-            '/stop - deregister',
-            '/status - brief status',
-            '/full_status - full status',
-            '/log - log',
-        ])
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=help_txt)
-
-    async def bot_cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self.check_user("start", update, context):
-            return
-
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="Registered")
-        self.registered_chat_ids_set.add(update.effective_chat.id)
-
-    async def bot_cmd_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self.check_user("stop", update, context):
-            return
-
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="Deregistering you")
-        self.registered_chat_ids_set.remove(update.effective_chat.id)
-
     async def bot_cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self.check_user("status", update, context):
-            return
+        async with self.notifier_telegram.handler_helper("status", update, context) as hlp:
+            if not hlp.auth_ok:
+                return
 
-        self.last_cmd_status = time.time()
-        r = self.shorten_status(self.last_ups_status)
-        status_age = time.time() - self.last_ups_status_time
-        logger.info(f"Sending status response with age {status_age} s: {r}")
-        await context.bot.send_message(chat_id=update.effective_chat.id,
-                                       text=f"Status: {json.dumps(r, indent=2)}, {'%.2f' % status_age} s old")
+            self.last_cmd_status = time.time()
+            r = self.shorten_status(self.last_ups_status)
+            status_age = time.time() - self.last_ups_status_time
+            logger.info(f"Sending status response with age {status_age} s: {r}")
+            await hlp.reply_msg(f"Status: {json.dumps(r, indent=2)}, {'%.2f' % status_age} s old")
 
     async def bot_cmd_full_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self.check_user("full_status", update, context):
-            return
+        async with self.notifier_telegram.handler_helper("full_status", update, context) as hlp:
+            if not hlp.auth_ok:
+                return
 
-        self.last_cmd_status = time.time()
-        r = self.last_ups_status
-        status_age = time.time() - self.last_ups_status_time
-        logger.info(f"Sending status response with age {status_age} s: {self.last_ups_status}")
-        await context.bot.send_message(chat_id=update.effective_chat.id,
-                                       text=f"Status: {json.dumps(r, indent=2)}, {'%.2f' % status_age} s old")
+            self.last_cmd_status = time.time()
+            r = self.last_ups_status
+            status_age = time.time() - self.last_ups_status_time
+            logger.info(f"Sending status response with age {status_age} s: {self.last_ups_status}")
+            await hlp.reply_msg(f"Status: {json.dumps(r, indent=2)}, {'%.2f' % status_age} s old")
 
     async def bot_cmd_log(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self.check_user("log", update, context):
-            return
-
         def _txt_log(r):
             if isinstance(r['msg'], str):
                 rr = dict(r)
@@ -526,12 +362,15 @@ class UpsMonit:
                 return f'{json.dumps(rr, indent=2)}, msg: {r["msg"]}'
             return json.dumps(r, indent=2)
 
-        last_log = list(reversed(list(itertools.islice(reversed(self.event_log_deque), self.log_report_len))))
+        async with self.notifier_telegram.handler_helper("log", update, context) as hlp:
+            if not hlp.auth_ok:
+                return
 
-        last_log_txt = [f' - {_txt_log(x)}' % x for x in last_log]
-        last_log_txt = "\n".join(last_log_txt)
-        log_msg = f'Last {self.log_report_len} log reports: \n{last_log_txt}'
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=log_msg)
+            last_log = list(reversed(list(itertools.islice(reversed(self.event_log_deque), self.log_report_len))))
+            last_log_txt = [f' - {_txt_log(x)}' % x for x in last_log]
+            last_log_txt = "\n".join(last_log_txt)
+            log_msg = f'Last {self.log_report_len} log reports: \n{last_log_txt}'
+            await hlp.reply_msg(log_msg)
 
     async def event_handler(self):
         notif_type = os.getenv('NOTIFYTYPE')
@@ -545,9 +384,7 @@ class UpsMonit:
         logger.info(f'Main thread finishing')
 
     async def send_telegram_notif(self, notif):
-        for chat_id in self.registered_chat_ids_set:
-            logger.info(f'Sending telegram notif {notif}, chat id: {chat_id}')
-            await self.bot_app.bot.send_message(chat_id, notif)
+        await self.notifier_telegram.send_telegram_notif(notif)
 
     def send_telegram_notif_on_main(self, notif):
         coro = self.send_telegram_notif(notif)

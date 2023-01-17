@@ -121,6 +121,8 @@ class FiFoComm:
         self.fifo_path = fifo_path
         self.fifo_thread = None
         self.handler = handler
+        self.start_error = None
+        self.start_finished = False
 
     def _check_is_running(self):
         if self.is_running_fnc:
@@ -143,6 +145,7 @@ class FiFoComm:
             logger.warning(f'Error unlinking fifo {e}', exc_info=e)
 
     def start(self):
+        self.start_finished = False
         if not self.handler:
             logger.warning(f'FiFo comm has no handler set')
 
@@ -158,6 +161,8 @@ class FiFoComm:
                 logger.error(f'Error starting server fifo: {e}', exc_info=e)
                 self.start_error = e
                 return
+            finally:
+                self.start_finished = True
 
             with open(self.fifo_path) as fifo:
                 while self._check_is_running():
@@ -181,6 +186,14 @@ class FiFoComm:
         self.fifo_thread.daemon = False
         self.fifo_thread.start()
 
+        ttime = time.time()
+        while not self.start_finished:
+            if self.start_error:
+                raise self.start_error
+            if time.time() - ttime > 30.0:
+                raise ValueError('Init error: timeout')
+            time.sleep(0.01)
+
     def stop(self):
         self.is_running = False
         try_fnc(lambda: self.destroy_fifo())
@@ -203,6 +216,8 @@ class TcpComm:
 
         self.server_thread = None
         self.server_tcp = None
+        self.start_error = None
+        self.start_finished = False
 
     def _check_is_running(self):
         if self.is_running_fnc:
@@ -215,6 +230,7 @@ class TcpComm:
             logger.warning(f'TcpComm has no handler set')
 
         sself = self
+        self.start_finished = False
 
         class TcpServerHandler(socketserver.BaseRequestHandler):
             def handle(self):
@@ -235,6 +251,8 @@ class TcpComm:
             try:
                 self.server_tcp = socketserver.TCPServer((self.server_host, self.server_port), TcpServerHandler)
                 self.server_tcp.allow_reuse_address = True
+
+                self.start_finished = True
                 self.server_tcp.serve_forever()
             except Exception as e:
                 self.start_error = e
@@ -245,6 +263,15 @@ class TcpComm:
         self.server_thread = threading.Thread(target=server_internal, args=())
         self.server_thread.daemon = False
         self.server_thread.start()
+
+        time.sleep(0.5)
+        ttime = time.time()
+        while not self.start_finished:
+            if self.start_error:
+                raise self.start_error
+            if time.time() - ttime > 30.0:
+                raise ValueError('Init error: timeout')
+            time.sleep(0.01)
 
     def stop(self):
         if not self.server_tcp:
