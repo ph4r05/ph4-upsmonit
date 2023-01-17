@@ -1,0 +1,9 @@
+{
+  "ups_name": "servers",
+  "bot_url": "t.me/monit_bot",
+  "bot_apikey": "24423424234:AAEasdasdasasdasdasd",
+  "jwt_key": "jwtkey",
+  "allowed_usernames": ["telegram_username"],
+  "allowed_userids": [1111111111],
+  "registered_chat_ids": [1111111111]
+}

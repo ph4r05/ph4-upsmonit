@@ -1,0 +1,26 @@
+# -----------------------------------------
+# /etc/systemd/system/ph4upsmon.service
+# -----------------------------------------
+[Unit]
+Description=ph4upsmon
+After=network.target
+After=nut-server.service
+
+[Service]
+User=nut
+Group=nut
+WorkingDirectory=~
+RuntimeDirectory=~
+
+Type=simple
+Environment=DNS_PUBLIC=tcp
+Environment=TORSOCKS_ALLOW_INBOUND=1
+
+ExecStart=/etc/nut/ph4upsmon.sh
+# 2>&1 | tee -a /var/log/ph4upsmon.log
+
+RestartSec=5
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

@@ -3,6 +3,7 @@
 
 import argparse
 import asyncio
+import collections
 import json
 import logging
 import os
@@ -14,6 +15,7 @@ import socket
 import socketserver
 import threading
 import time
+from datetime import datetime
 from queue import Queue
 
 import coloredlogs
@@ -109,6 +111,8 @@ class UpsMonit:
         self.registered_chat_ids_set = set()
         self.use_server = True
         self.use_fifo = False
+        self.report_interval_fast = 20
+        self.report_interval_slow = 5 * 60
 
         self.task_queue = Queue()
         self.is_running = True
@@ -126,6 +130,7 @@ class UpsMonit:
         self.bot_thread = None
 
         self.is_on_bat = False
+        self.last_ups_status_change = 0
         self.last_bat_report = 0
         self.last_norm_report = 0
         self.last_cmd_status = 0
@@ -151,6 +156,8 @@ class UpsMonit:
                             help='UDP server port')
         parser.add_argument('-f', '--fifo', dest='server_fifo', default='/tmp/ups-monitor-fifo',
                             help='Server fifo')
+        parser.add_argument('message', nargs=argparse.ZERO_OR_MORE,
+                            help='Text message from notifier')
         return parser
 
     def load_config(self):
@@ -216,10 +223,12 @@ class UpsMonit:
         start_handler = CommandHandler('start', self.bot_cmd_start)
         stop_handler = CommandHandler('stop', self.bot_cmd_stop)
         status_handler = CommandHandler('status', self.bot_cmd_status)
+        full_status_handler = CommandHandler('full_status', self.bot_cmd_full_status)
         self.bot_app.add_handler(start_handler)
         self.bot_app.add_handler(stop_handler)
         self.bot_app.add_handler(stop_handler)
         self.bot_app.add_handler(status_handler)
+        self.bot_app.add_handler(full_status_handler)
 
     def load_bot_thread(self):
         """Running bot in a separate thread. Experimental method.
@@ -284,7 +293,7 @@ class UpsMonit:
 
     async def load_bot_async(self):
         if not self.bot_apikey:
-            logger.info('Telegram bot API key not configured')
+            logger.warning('Telegram bot API key not configured')
             return
 
         def error_callback(exc: TelegramError) -> None:
@@ -332,12 +341,18 @@ class UpsMonit:
             while self.is_running:
                 try:
                     t = time.time()
-                    if t - self.status_thread_last_check < 2000.5:
+                    if t - self.status_thread_last_check < 2.5:
                         continue
+
                     r = self.get_ups_state()
                     self.last_ups_status = r
                     self.last_ups_status_time = t
                     self.status_thread_last_check = t
+                    self.last_ups_status['meta.time_check'] = t
+                    self.last_ups_status['meta.dt_check'] = datetime.now().strftime("%m/%d/%Y, %H:%M:%S")
+                    if 'battery.runtime' in r:
+                        self.last_ups_status['meta.battery.runtime.m'] = round(100 * (r['battery.runtime'] / 60)) / 100
+                    try_fnc(lambda: self.on_new_ups_state(self.last_ups_status))
 
                 except Exception as e:
                     logger.error(f'Status thread exception: {e}', exc_info=e)
@@ -478,6 +493,9 @@ class UpsMonit:
 
         # Normal daemon mode
         try:
+            if not self.ups_name:
+                raise Exception('UPS name to monitor is not defined')
+
             self.init_signals()
             self.start_status_thread()
             if self.use_fifo:
@@ -542,9 +560,15 @@ class UpsMonit:
         if not await self.check_user("status", update, context):
             return
 
-        if time.time() - self.last_cmd_status < 3:
-            await context.bot.send_message(chat_id=update.effective_chat.id,
-                                           text=f"Status too often {time.time() - self.last_cmd_status} s")
+        self.last_cmd_status = time.time()
+        r = self.shorten_status(self.last_ups_status)
+        status_age = time.time() - self.last_ups_status_time
+        logger.info(f"Sending status response with age {status_age} s: {r}")
+        await context.bot.send_message(chat_id=update.effective_chat.id,
+                                       text=f"Status: {json.dumps(r, indent=2)}, {'%.2f' % status_age} s old")
+
+    async def bot_cmd_full_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self.check_user("full_status", update, context):
             return
 
         self.last_cmd_status = time.time()
@@ -552,12 +576,12 @@ class UpsMonit:
         status_age = time.time() - self.last_ups_status_time
         logger.info(f"Sending status response with age {status_age} s: {self.last_ups_status}")
         await context.bot.send_message(chat_id=update.effective_chat.id,
-                                       text=f"Status: {json.dumps(r, indent=2)}, {status_age} s old")
+                                       text=f"Status: {json.dumps(r, indent=2)}, {'%.2f' % status_age} s old")
 
     async def event_handler(self):
         notif_type = os.getenv('NOTIFYTYPE')
         logger.info(f'Event OS: {os.environ}, notif type: {notif_type}')
-        payload = {'type': 'event', 'notif': notif_type}
+        payload = {'type': 'event', 'notif': notif_type, 'msg': self.args.message}
 
         self.send_daemon_message(payload)
 
@@ -576,6 +600,10 @@ class UpsMonit:
         for chat_id in self.registered_chat_ids_set:
             logger.info(f'Sending telegram notif {notif}, chat id: {chat_id}')
             await self.bot_app.bot.send_message(chat_id, notif)
+
+    def send_telegram_notif_on_main(self, notif):
+        coro = self.send_telegram_notif(notif)
+        self.task_queue.put(coro)
 
     def send_daemon_message(self, payload):
         if self.use_server:
@@ -605,15 +633,15 @@ class UpsMonit:
             tcp_client.close()
 
     def process_fifo_data(self, data):
-        logger.info(f'Data read from fifo: {data}, len: {len(data)}')
-        self.process_message(data)
+        logger.debug(f'Data read from fifo: {data}, len: {len(data)}')
+        self.process_client_message(data)
 
     def process_server_data(self, data):
-        logger.info(f'TCP server data received: {data}')
-        self.process_message(data)
+        logger.debug(f'TCP server data received: {data}')
+        self.process_client_message(data)
         return json.dumps({'response': 200}).encode()
 
-    def process_message(self, data):
+    def process_client_message(self, data):
         lines = data.splitlines(False)
         for line in lines:
             try:
@@ -623,12 +651,52 @@ class UpsMonit:
 
                 js_type = js['type']
                 if js_type == 'event':
-                    notif = js['notif']
-
-                    self.task_queue.put(self.send_telegram_notif(f'UPS event: {notif}'))
+                    self.on_ups_event(js)
 
             except Exception as e:
                 logger.warning(f'Exception in processing server fifo: {e}', exc_info=e)
+
+    def on_ups_event(self, js):
+        self.status_thread_last_check = 0
+
+        notif = js['notif']
+        msg = js['msg'] if 'msg' in js else '-'
+        if isinstance(msg, list):
+            msg = try_fnc(lambda: ' '.join(msg))
+
+        status = json.dumps(self.shorten_status(self.last_ups_status) or {}, indent=2)
+        msg = f'UPS event: {notif}, message: {msg}, status: {status}'
+        logger.info(msg)
+
+        self.send_telegram_notif_on_main(msg)
+
+    def on_new_ups_state(self, r):
+        t = time.time()
+        ups_state = r['ups.status']
+        is_online = ups_state == 'OL'
+        is_on_bat = not is_online  # simplification
+
+        do_report = False
+        if self.is_on_bat != is_on_bat:
+            old_state_change = self.last_ups_status_change
+            logger.info(f'Detected UPS change detected {ups_state}, last state change: {t - old_state_change}')
+            self.last_ups_status_change = t
+            self.is_on_bat = is_on_bat
+            do_report = True
+
+        if self.is_on_bat:
+            t_diff = t - self.last_bat_report
+            is_fast = self.last_bat_report == 0 or t_diff < 5 * 60
+            do_report |= (is_fast and t_diff >= self.report_interval_fast) or \
+                         (not is_fast and t_diff >= self.report_interval_slow)
+
+        if do_report:
+            t_diff = t - self.last_ups_status_change
+            status = json.dumps(self.shorten_status(self.last_ups_status) or {}, indent=2)
+            self.send_telegram_notif_on_main(
+                f'UPS state report [is_online={is_online}, age={"%.2f" % t_diff}]: {status}'
+            )
+            self.last_bat_report = t
 
     def get_ups_state(self):
         runner = get_runner([f'/usr/bin/upsc', self.ups_name], shell=False)
@@ -639,7 +707,37 @@ class UpsMonit:
         ret = parse_ups(out)
         return ret
 
+    def _get_tuple(self, key, dict):
+        return key, dict[key]
 
-if __name__ == '__main__':
+    def shorten_status(self, status):
+        if not status:
+            return status
+        try:
+            r = collections.OrderedDict([
+                self._get_tuple('battery.charge', status),
+                self._get_tuple('battery.runtime', status),
+                self._get_tuple('battery.voltage', status),
+                self._get_tuple('input.voltage', status),
+                self._get_tuple('output.voltage', status),
+                self._get_tuple('ups.load', status),
+                self._get_tuple('ups.status', status),
+                self._get_tuple('ups.test.result', status),
+                self._get_tuple('meta.battery.runtime.m', status),
+                self._get_tuple('meta.time_check', status),
+                self._get_tuple('meta.dt_check', status),
+            ])
+            return r
+        except Exception as e:
+            logger.warning(f'Excetion shortening the status {e}', exc_info=e)
+            return status
+
+
+
+def main():
     monit = UpsMonit()
     monit.main()
+
+
+if __name__ == '__main__':
+    main()
