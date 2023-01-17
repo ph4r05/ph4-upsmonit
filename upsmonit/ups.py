@@ -131,6 +131,7 @@ class UpsMonit:
         self.bot_thread = None
 
         self.is_on_bat = False
+        self.last_ups_state_txt = None
         self.last_ups_status_change = 0
         self.last_bat_report = 0
         self.last_norm_report = 0
@@ -373,15 +374,14 @@ class UpsMonit:
         self.status_thread.start()
 
     def start_fifo_thread(self):
-        main_loop = asyncio.get_running_loop()
-
         def fifo_internal():
             logger.info('Starting fifo thread')
             try:
                 self.destroy_fifo()
                 self.create_fifo()
-                with open(self.server_fifo) as fifo:
+                with open(self.server_fifo) as _:
                     pass
+
             except Exception as e:
                 logger.error(f'Error starting server fifo: {e}', exc_info=e)
                 self.start_error = e
@@ -396,8 +396,6 @@ class UpsMonit:
                             continue
 
                         self.process_fifo_data(data)
-                        # main_loop.call_soon(self.process_fifo_data, data)
-                        # main_loop.run_until_complete(self.process_fifo_data(data))
 
                     except Exception as e:
                         logger.error(f'Fifo thread exception: {e}', exc_info=e)
@@ -542,8 +540,8 @@ class UpsMonit:
 
     async def check_user(self, method, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_allowed = self.is_user_allowed(update.message.from_user)
-        logger.info(f'New "{method}" message with chat_id: {update.effective_chat.id}, from {update.message.from_user}, '
-                    f'allowed {user_allowed}')
+        logger.info(f'New "{method}" message with chat_id: {update.effective_chat.id}, from {update.message.from_user}'
+                    f', allowed {user_allowed}')
         if not user_allowed:
             await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Fuck off")
             return False
@@ -607,7 +605,7 @@ class UpsMonit:
                 return f'{json.dumps(rr, indent=2)}, msg: {r["msg"]}'
             return json.dumps(r, indent=2)
 
-        last_log = list(itertools.islice(reversed(self.event_log_deque), self.log_report_len))
+        last_log = list(reversed(list(itertools.islice(reversed(self.event_log_deque), self.log_report_len))))
 
         last_log_txt = [f' - {_txt_log(x)}' % x for x in last_log]
         last_log_txt = "\n".join(last_log_txt)
@@ -719,21 +717,29 @@ class UpsMonit:
         self.send_telegram_notif_on_main(msg)
 
     def on_new_ups_state(self, r):
+        """
+        https://github.com/networkupstools/nut/blob/03c3bbe8df9a2caf3c09c120ae7045d35af99b76/drivers/apcupsd-ups.h
+        """
+
         t = time.time()
         ups_state = r['ups.status']
-        is_online = ups_state == 'OL'
-        is_on_bat = not is_online  # simplification
+
+        state_comp = ups_state.split(' ', 2)
+        is_online = state_comp[0] == 'OL'
+        is_charging = ups_state == 'OL CHRG'
+        is_on_bat = not is_online and not is_charging  # simplification
 
         do_report = False
-        if self.is_on_bat != is_on_bat:
+        if self.last_ups_state_txt != ups_state:
             old_state_change = self.last_ups_status_change
             logger.info(f'Detected UPS change detected {ups_state}, last state change: {t - old_state_change}')
+            self.last_ups_state_txt = ups_state
             self.last_ups_status_change = t
             self.is_on_bat = is_on_bat
             do_report = True
 
             status = json.dumps(self.shorten_status(self.last_ups_status) or {}, indent=2)
-            msg = f'UPS state report [is_online={is_online}, age={"%.2f" % (t - self.last_bat_report)}]: {status}'
+            msg = f'UPS state report [{ups_state}, age={"%.2f" % (t - self.last_bat_report)}]: {status}'
             self.add_log(msg, mtype='ups-change')
 
         if self.is_on_bat:
@@ -746,7 +752,7 @@ class UpsMonit:
             t_diff = t - self.last_ups_status_change
             status = json.dumps(self.shorten_status(self.last_ups_status) or {}, indent=2)
             self.send_telegram_notif_on_main(
-                f'UPS state report [is_online={is_online}, age={"%.2f" % t_diff}]: {status}'
+                f'UPS state report [{ups_state}, age={"%.2f" % t_diff}]: {status}'
             )
             self.last_bat_report = t
 
@@ -781,9 +787,8 @@ class UpsMonit:
             ])
             return r
         except Exception as e:
-            logger.warning(f'Excetion shortening the status {e}', exc_info=e)
+            logger.warning(f'Exception shortening the status {e}', exc_info=e)
             return status
-
 
 
 def main():
