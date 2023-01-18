@@ -38,6 +38,7 @@ class ConnectionMonit:
         self.email_notif_recipients = []
         self.report_interval_fast = 20
         self.report_interval_slow = 5 * 60
+        self.conn_timeout = 5.0
 
         self.is_running = True
         self.worker = Worker(running_fnc=lambda: self.is_running)
@@ -282,18 +283,19 @@ class ConnectionMonit:
     def on_new_conn_state(self, r):
         t = time.time()
         report = self.gen_report(r)
+        report_extended = self.gen_report(r, extended=True)
 
         do_report = False
         in_state_report = False
 
         if self.last_conn_report_txt != report:
             old_state_change = self.last_conn_status_change
-            logger.info(f'Detected conn change detected, last state change: {t - old_state_change}, report: \n{report}')
+            logger.info(f'Detected conn change detected, last state change: {t - old_state_change}, report: \n{report_extended}')
             self.last_conn_report_txt = report
             self.last_conn_status_change = t
             do_report = True
 
-            msg = f'Conn state report [age={"%.2f" % (t - self.last_bat_report)}]: \n{report}'
+            msg = f'Conn state report [age={"%.2f" % (t - self.last_bat_report)}]: \n{report_extended}'
             self.add_log(msg, mtype='conn-change')
 
         # if self.is_on_bat:
@@ -304,7 +306,7 @@ class ConnectionMonit:
 
         if do_report or in_state_report:
             t_diff = t - self.last_conn_status_change
-            txt_msg = f'Conn state report [age={"%.2f" % t_diff}]: \n{report}'
+            txt_msg = f'Conn state report [age={"%.2f" % t_diff}]: \n{report_extended}'
             self.send_telegram_notif_on_main(txt_msg)
             if do_report:
                 self.notify_via_email_async(txt_msg, f'Conn change {datetime.now().strftime("%m/%d/%Y, %H:%M:%S")}')
@@ -356,9 +358,13 @@ class ConnectionMonit:
                 if is_http:
                     write_payload = 'GET / HTTP/1.0\n\n'.encode()
 
-                is_open = test_port_open(host, port, timeout=2, read_header=read_header, write_payload=write_payload)
+                t = time.time()
+                is_open = test_port_open(host, port, timeout=self.conn_timeout,
+                                         read_header=read_header, write_payload=write_payload)
                 check_res['open'] = is_open[0]
-                open_data = is_open[1]
+                check_res['attempts'] = is_open[1]
+                check_res['check_time'] = time.time() - t
+                open_data = is_open[2]
 
                 check_res['app'] = None
                 if not is_open:
@@ -383,14 +389,18 @@ class ConnectionMonit:
 
         return r
 
-    def gen_report(self, status):
+    def gen_report(self, status, extended=False):
         conns = status['connections']
         acc = []
         for conn in conns:
             host, port, name, ctype, app = conn['host'], conn['port'], conn['name'], conn['type'], conn['app']
             check_res = conn['check_res']
+            attempts = f' ({defvalkey(check_res, "attempts", "-")}x)' if extended else ''
+            elapsed = f', {"%.2f" % defvalkey(check_res, "check_time", 0)}s' if extended else ''
+
             acc.append(f'{name} @ {host}:{port} - {app} over {ctype}, '
-                       f'open: {defvalkey(check_res, "open", False)}, app: {defvalkey(check_res, "app", "?")}')
+                       f'open: {defvalkey(check_res, "open", False)}{attempts}, '
+                       f'app: {defvalkey(check_res, "app", "?")}{elapsed}')
         return "\n".join(acc)
 
 
