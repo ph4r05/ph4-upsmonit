@@ -13,3 +13,4 @@ profile-a*.json*
 account-data.json
 assets/config.json
 assets/ups*.txt
+config.json

@@ -10,6 +10,7 @@ install_requires = [
     'setuptools>=1.0',
     'six',
     'future',
+    'shellescape',
     'asyncio',
     'coloredlogs',
     'ph4-runner',
