@@ -59,6 +59,7 @@ class ConnectionMonit:
 
         self.event_log_deque = collections.deque([], 5_000)
         self.log_report_len = 12
+        self.do_email_reports = True
 
     def argparser(self):
         parser = argparse.ArgumentParser(description='Tunnel monitoring')
@@ -130,12 +131,18 @@ class ConnectionMonit:
             '/status - brief status',
             '/full_status - full status',
             '/log - log',
+            '/noemail',
+            '/doemail',
         ]
 
         status_handler = CommandHandler('status', self.bot_cmd_status)
         full_status_handler = CommandHandler('full_status', self.bot_cmd_full_status)
         log_handler = CommandHandler('log', self.bot_cmd_log)
-        self.notifier_telegram.add_handlers([status_handler, full_status_handler, log_handler])
+        noemail_handler = CommandHandler('noemail', self.bot_cmd_noemail)
+        doemail_handler = CommandHandler('doemail', self.bot_cmd_doemail)
+        self.notifier_telegram.add_handlers([
+            status_handler, full_status_handler, log_handler, noemail_handler, doemail_handler
+        ])
 
     async def start_bot_async(self):
         self.init_bot()
@@ -225,7 +232,7 @@ class ConnectionMonit:
             if not hlp.auth_ok:
                 return
 
-            r = self.gen_report(self.last_con_status)
+            r = self.gen_report(self.last_con_status, extended=True)
             status_age = time.time() - self.last_con_status_time
             logger.info(f"Sending status response with age {status_age} s: \n{r}")
             await hlp.reply_msg(f"Status: {r}, {'%.2f' % status_age} s old")
@@ -257,6 +264,22 @@ class ConnectionMonit:
             last_log_txt = "\n".join(last_log_txt)
             log_msg = f'Last {self.log_report_len} log reports: \n{last_log_txt}'
             await hlp.reply_msg(log_msg)
+
+    async def bot_cmd_noemail(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        async with self.notifier_telegram.handler_helper("noemail", update, context) as hlp:
+            if not hlp.auth_ok:
+                return
+
+            self.do_email_reports = False
+            await hlp.reply_msg(f"OK")
+
+    async def bot_cmd_doemail(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        async with self.notifier_telegram.handler_helper("doemail", update, context) as hlp:
+            if not hlp.auth_ok:
+                return
+
+            self.do_email_reports = True
+            await hlp.reply_msg(f"OK")
 
     async def main_handler(self):
         await self.asyncWorker.work()
@@ -308,7 +331,7 @@ class ConnectionMonit:
             t_diff = t - self.last_conn_status_change
             txt_msg = f'Conn state report [age={"%.2f" % t_diff}]: \n{report_extended}'
             self.send_telegram_notif_on_main(txt_msg)
-            if do_report:
+            if do_report and self.do_email_reports:
                 self.notify_via_email_async(txt_msg, f'Conn change {datetime.now().strftime("%m/%d/%Y, %H:%M:%S")}')
             self.last_bat_report = t
 
