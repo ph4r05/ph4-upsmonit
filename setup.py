@@ -19,6 +19,7 @@ install_requires = [
     'jsonpath_ng',
     'PyJWT==2.6.0',
     'python-telegram-bot',
+    'psutil',
 ]
 
 dev_extras = [
@@ -76,6 +77,7 @@ setup(
     entry_points={
         'console_scripts': [
             'ph4-ups-mon = upsmonit.ups:main',
+            'ph4-con-mon = upsmonit.conn:main',
         ],
     }
 )
