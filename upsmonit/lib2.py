@@ -21,7 +21,7 @@ def is_port_listening(port, tcp=True):
     return None
 
 
-def test_port_open(host='127.0.0.1', port=80, timeout=15, attempts=3, tcp=True):
+def test_port_open(host='127.0.0.1', port=80, timeout=15, attempts=3, tcp=True, read_header=False, write_payload=None):
     idx = 0
     while idx < attempts:
         sock = None
@@ -32,9 +32,20 @@ def test_port_open(host='127.0.0.1', port=80, timeout=15, attempts=3, tcp=True):
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 sock.settimeout(timeout)
 
+            read_data = None
+            if read_header:
+                read_data = sock.recv(4096)
+            elif write_payload:
+                if tcp:
+                    sock.sendall(write_payload)
+                else:
+                    sock.sendto(write_payload, (host, port))
+                read_data = sock.recv(4096)
+
             silent_close(sock)
             sock = None
-            return True
+
+            return True, read_data
 
         except:
             time.sleep(0.1)
@@ -44,4 +55,4 @@ def test_port_open(host='127.0.0.1', port=80, timeout=15, attempts=3, tcp=True):
             idx += 1
             silent_close(sock)
 
-    return False
+    return False, None

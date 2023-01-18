@@ -4,6 +4,7 @@
 import argparse
 import asyncio
 import collections
+import copy
 import itertools
 import json
 import logging
@@ -20,7 +21,7 @@ from ph4runner import install_sarge_filter
 from telegram import Update
 from telegram.ext import ContextTypes, CommandHandler
 
-from upsmonit.lib import Worker, AsyncWorker, NotifyEmail, jsonpath, try_fnc
+from upsmonit.lib import Worker, AsyncWorker, NotifyEmail, jsonpath, try_fnc, defvalkey
 from upsmonit.lib2 import is_port_listening, test_port_open
 from upsmonit.tbot import TelegramBot
 
@@ -325,7 +326,7 @@ class ConnectionMonit:
 
     def check_connections_state(self):
         r = {
-            'connections': list(self.watching_connections),
+            'connections': copy.deepcopy(self.watching_connections),
             'check_pass': True
         }
 
@@ -347,9 +348,31 @@ class ConnectionMonit:
                     listen_conn = is_port_listening(port)
                     check_res['local_listen'] = listen_conn is not None
 
-                is_open = test_port_open(host, port, timeout=2)
-                check_res['open'] = is_open
+                is_ssh = app == 'ssh'
+                is_http = app in ['http', 'https']
+
+                read_header = is_ssh
+                write_payload = None
+                if is_http:
+                    write_payload = 'GET / HTTP/1.0\n\n'.encode()
+
+                is_open = test_port_open(host, port, timeout=2, read_header=read_header, write_payload=write_payload)
+                check_res['open'] = is_open[0]
+                open_data = is_open[1]
+
+                check_res['app'] = None
                 if not is_open:
+                    check_res['app'] = None
+
+                if is_open and is_ssh:
+                    ssh_header = try_fnc(lambda: str(open_data.decode().strip())[:50])
+                    check_res['app'] = ssh_header
+
+                if is_open and is_http:
+                    http_resp = try_fnc(lambda: str(open_data.decode().strip())[:50])
+                    check_res['app'] = http_resp.startswith('HTTP')
+
+                if not is_open[0]:
                     r['check_pass'] = False
 
             except Exception as e:
@@ -366,7 +389,8 @@ class ConnectionMonit:
         for conn in conns:
             host, port, name, ctype, app = conn['host'], conn['port'], conn['name'], conn['type'], conn['app']
             check_res = conn['check_res']
-            acc.append(f'{name} @ {host}:{port} - {app} over {ctype}, open: {check_res["open"]}')
+            acc.append(f'{name} @ {host}:{port} - {app} over {ctype}, '
+                       f'open: {defvalkey(check_res, "open", False)}, app: {defvalkey(check_res, "app", "?")}')
         return "\n".join(acc)
 
 
