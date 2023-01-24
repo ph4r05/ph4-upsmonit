@@ -17,13 +17,14 @@ from datetime import datetime
 from typing import List
 
 import coloredlogs
-from ph4runner import install_sarge_filter
+from ph4monitlib import jsonpath, defvalkey
+from ph4monitlib.net import test_port_open, is_port_listening
+from ph4monitlib.notif import NotifyEmail
+from ph4monitlib.tbot import TelegramBot
+from ph4monitlib.worker import Worker, AsyncWorker
+from ph4runner import install_sarge_filter, try_fnc
 from telegram import Update
 from telegram.ext import ContextTypes, CommandHandler
-
-from upsmonit.lib import Worker, AsyncWorker, NotifyEmail, jsonpath, try_fnc, defvalkey
-from upsmonit.lib2 import is_port_listening, test_port_open
-from upsmonit.tbot import TelegramBot
 
 logger = logging.getLogger(__name__)
 coloredlogs.install(level=logging.INFO)

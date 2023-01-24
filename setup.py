@@ -14,12 +14,10 @@ install_requires = [
     'asyncio',
     'coloredlogs',
     'ph4-runner',
-    'blessed',
     'requests',
     'jsonpath_ng',
     'PyJWT==2.6.0',
-    'python-telegram-bot',
-    'psutil',
+    'ph4-monitlib',
 ]
 
 dev_extras = [

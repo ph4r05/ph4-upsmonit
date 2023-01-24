@@ -17,12 +17,14 @@ from typing import List
 
 import coloredlogs
 import jwt
+from ph4monitlib import jsonpath, try_fnc, get_runner
+from ph4monitlib.comm import FiFoComm, TcpComm
+from ph4monitlib.notif import NotifyEmail
+from ph4monitlib.tbot import TelegramBot
+from ph4monitlib.worker import Worker, AsyncWorker
 from ph4runner import install_sarge_filter
 from telegram import Update
 from telegram.ext import ContextTypes, CommandHandler
-
-from upsmonit.lib import Worker, AsyncWorker, FiFoComm, TcpComm, NotifyEmail, jsonpath, try_fnc, get_runner
-from upsmonit.tbot import TelegramBot
 
 logger = logging.getLogger(__name__)
 coloredlogs.install(level=logging.INFO)
