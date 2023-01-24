@@ -30,7 +30,7 @@ This package then collects events from [NUT] and continuously monitors UPSs stat
 
 ## Setup
 
-- pip-install this package
+- pip-install this package `pip install -U ph4-upsmonit`
 - Configure `config.json` according to [assets/config-example.json](assets/config-example.json)
 - Configure notification channels, either 
   - [Telegram bot](https://www.teleme.io/articles/create_your_own_telegram_bot?hl=en) 
@@ -86,5 +86,7 @@ If email user is empty, email notifier is not use. Likewise, if bot API key is e
 
 ## Dependencies
 This project uses monitoring tool library https://github.com/ph4r05/ph4-monitlib
+
+Similar project for monitoring network connections (SSH tunnels): https://github.com/ph4r05/ph4-connmon
 
 [NUT]: https://networkupstools.org
