@@ -20,7 +20,7 @@ This package then collects events from [NUT] and continuously monitors UPSs stat
            ┌──────┴───────┐       │    │
 ┌──────┐   │              │       │
 │Power ├───┤     UPS      ├───────┤    │
-└──────┘   │              │       │    │Eth
+└──────┘   │              │       │     Eth
            └──────────────┘       │    │
                               ┌───┴────┴─┐
                               │   WiFi   │
@@ -31,10 +31,12 @@ This package then collects events from [NUT] and continuously monitors UPSs stat
 ## Setup
 
 - pip-install this package
-- Configure `config.json` according to `assets/config-example.json`
-- Configure either [Telegram bot](https://www.teleme.io/articles/create_your_own_telegram_bot?hl=en) or Email sender (e.g., [Gmail](https://www.lifewire.com/get-a-password-to-access-gmail-by-pop-imap-2-1171882)) or both
+- Configure `config.json` according to [assets/config-example.json](assets/config-example.json)
+- Configure notification channels, either 
+  - [Telegram bot](https://www.teleme.io/articles/create_your_own_telegram_bot?hl=en) 
+  - or Email sender (e.g., [Gmail](https://www.lifewire.com/get-a-password-to-access-gmail-by-pop-imap-2-1171882)) or both
 - Run `assets/install.sh` to install `ph4upsmon.service` systemd service
-- Configure [NUT] to send events to ph4upsmon as install script instructs you
+- Configure [NUT] to send events to `ph4upsmon` as install script instructs you
 - Run `systemctl start ph4upsmon.service`
 
 ## Notification examples
