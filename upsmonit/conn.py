@@ -118,6 +118,8 @@ class ConnectionMonit:
     def _stop_app_on_signal(self):
         logger.info(f'Signal received')
         self.is_running = False
+        self.asyncWorker.stop()
+        self.worker.stop()
 
     def init_signals(self):
         stop_signals = (signal.SIGINT, signal.SIGTERM, signal.SIGABRT) if platform.system() != "Windows" else []

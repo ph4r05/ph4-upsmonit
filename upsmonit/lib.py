@@ -16,7 +16,7 @@ import time
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from queue import Queue
-from typing import List
+from typing import List, Optional
 
 import coloredlogs
 from jsonpath_ng import parse
@@ -65,29 +65,47 @@ def get_runner(cli, args=None, cwd=None, shell=False, env=None):
 
 class AsyncWorker:
     def __init__(self, running_fnc=None):
-        self.task_queue = Queue()
+        self.task_queue: Optional[asyncio.Queue] = None
         self.is_running = True
         self.is_running_fnc = running_fnc
+        self.buffer = []
 
     def _check_is_running(self):
-        if self.is_running_fnc:
-            if not self.is_running_fnc():
-                return False
+        if self.is_running_fnc and not self.is_running_fnc():
+            return False
         return self.is_running
 
     async def work(self):
+        """Starts work loop on task_queue. Remember to call stop() to terminate this coroutine."""
+        self.is_running = True
+        self.task_queue = asyncio.Queue()
+        for x in self.buffer:
+            self.task_queue.put_nowait(x)
+        self.buffer = None
+
         while self._check_is_running():
             try:
-                next_task = self.task_queue.get(False)
+                # next_task = self.task_queue.get_nowait()
+                next_task = await self.task_queue.get()
+
                 if not next_task:
-                    await asyncio.sleep(0.01)
+                    continue
+
                 await next_task
-            except queue.Empty:
-                await asyncio.sleep(0.02)
+            except asyncio.QueueEmpty:
+                await asyncio.sleep(0.05)
 
     def enqueue(self, task):
         """Enqueues coroutine function for execution"""
-        self.task_queue.put(task)
+        if not self.task_queue:
+            self.buffer.append(task)
+            return
+
+        self.task_queue.put_nowait(task)
+
+    def stop(self):
+        self.task_queue.put_nowait(None)  # unblocks waiting
+        self.is_running = False
 
 
 class Worker:
@@ -98,19 +116,21 @@ class Worker:
         self.is_running_fnc = running_fnc
 
     def _check_is_running(self):
-        if self.is_running_fnc:
-            if not self.is_running_fnc():
-                return False
+        if self.is_running_fnc and not self.is_running_fnc():
+            return False
         return self.is_running
 
-    def start_worker_thread(self):
+    def start_worker_thread(self, queue_timeout=0.5):
+        self.is_running = True
+
         def worker_internal():
             logger.info(f'Starting worker thread')
             while self._check_is_running():
                 try:
-                    next_task = self.worker_queue.get(False)
+                    next_task = self.worker_queue.get(True, queue_timeout)
                     if not next_task:
-                        time.sleep(0.02)
+                        continue
+
                     try:
                         next_task()
                     except Exception as e:
@@ -127,6 +147,9 @@ class Worker:
         """Enqueues lambda function for execution"""
         self.worker_queue.put(task)
 
+    def stop(self):
+        self.is_running = False
+
 
 class FiFoComm:
     def __init__(self, fifo_path=None, handler=None, running_fnc=None):
@@ -139,9 +162,8 @@ class FiFoComm:
         self.start_finished = False
 
     def _check_is_running(self):
-        if self.is_running_fnc:
-            if not self.is_running_fnc():
-                return False
+        if self.is_running_fnc and not self.is_running_fnc():
+            return False
         return self.is_running
 
     def create_fifo(self):
@@ -234,9 +256,8 @@ class TcpComm:
         self.start_finished = False
 
     def _check_is_running(self):
-        if self.is_running_fnc:
-            if not self.is_running_fnc():
-                return False
+        if self.is_running_fnc and not self.is_running_fnc():
+            return False
         return self.is_running
 
     def start(self):
