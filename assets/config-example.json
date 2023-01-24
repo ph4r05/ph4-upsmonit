@@ -5,5 +5,9 @@
   "jwt_key": "jwtkey",
   "allowed_usernames": ["telegram_username"],
   "allowed_userids": [1111111111],
-  "registered_chat_ids": [1111111111]
+  "registered_chat_ids": [1111111111],
+  "email_notif_recipients": ["notifyemail@gmail.com"],
+  "email_server": "smtp.gmail.com",
+  "email_user": "sender@gmail.com",
+  "email_pass": "sender-password"
 }
