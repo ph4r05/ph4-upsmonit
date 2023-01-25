@@ -17,7 +17,7 @@ from typing import List
 
 import coloredlogs
 import jwt
-from ph4monitlib import jsonpath, try_fnc, get_runner
+from ph4monitlib import jsonpath, try_fnc, get_runner, defvalkey
 from ph4monitlib.comm import FiFoComm, TcpComm
 from ph4monitlib.notif import NotifyEmail
 from ph4monitlib.tbot import TelegramBot
@@ -71,6 +71,16 @@ def parse_ups(log: str):
     return ret
 
 
+class TelegramNotifMsg:
+    def __init__(self, msg, mtype, t):
+        self.msg = msg
+        self.mtype = mtype
+        self.time = t
+
+    def __repr__(self) -> str:
+        return f'TelegramNotifMsg({self.msg}, {self.mtype}, {self.time})'
+
+
 class UpsMonit:
     def __init__(self):
         self.args = {}
@@ -91,6 +101,8 @@ class UpsMonit:
         self.tcp_comm = TcpComm(handler=self.process_server_data, running_fnc=lambda: self.is_running)
         self.notifier_email = NotifyEmail()
         self.notifier_telegram = TelegramBot()
+        self.notif_telegram_last_messages = {}
+        self.notif_telegram_update_messages = collections.defaultdict(lambda: dict())
 
         self.status_thread = None
         self.status_thread_last_check = 0
@@ -100,6 +112,8 @@ class UpsMonit:
         self.main_loop = None
         self.start_error = None
 
+        self.do_email_reports = True
+        self.notif_telegram_edit_time = 5 * 60
         self.is_on_bat = False
         self.last_ups_state_txt = None
         self.last_ups_status_change = 0
@@ -207,13 +221,22 @@ class UpsMonit:
         self.notifier_telegram.help_commands += [
             '/status - brief status',
             '/full_status - full status',
-            '/log - log',
+            '/log - log of latest events',
+            '/noemail - disable email reporting',
+            '/doemail - enable email reporting',
+            '/doedit <time> - edit last status message instead of sending a new one. Time to edit the old message in '
+            'seconds. ',
         ]
 
         status_handler = CommandHandler('status', self.bot_cmd_status)
         full_status_handler = CommandHandler('full_status', self.bot_cmd_full_status)
         log_handler = CommandHandler('log', self.bot_cmd_log)
-        self.notifier_telegram.add_handlers([status_handler, full_status_handler, log_handler])
+        noemail_handler = CommandHandler('noemail', self.bot_cmd_noemail)
+        doemail_handler = CommandHandler('doemail', self.bot_cmd_doemail)
+        doedit_handler = CommandHandler('doedit', self.bot_cmd_doedit)
+        self.notifier_telegram.add_handlers([
+            status_handler, full_status_handler, log_handler, noemail_handler, doemail_handler, doedit_handler,
+        ])
 
     async def start_bot_async(self):
         self.init_bot()
@@ -377,6 +400,35 @@ class UpsMonit:
             log_msg = f'Last {self.log_report_len} log reports: \n{last_log_txt}'
             await hlp.reply_msg(log_msg)
 
+    async def bot_cmd_noemail(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        async with self.notifier_telegram.handler_helper("noemail", update, context) as hlp:
+            if not hlp.auth_ok:
+                return
+
+            self.do_email_reports = False
+            await hlp.reply_msg(f"OK")
+
+    async def bot_cmd_doemail(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        async with self.notifier_telegram.handler_helper("doemail", update, context) as hlp:
+            if not hlp.auth_ok:
+                return
+
+            self.do_email_reports = True
+            await hlp.reply_msg(f"OK")
+
+    async def bot_cmd_doedit(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        async with self.notifier_telegram.handler_helper("doedit", update, context) as hlp:
+            if not hlp.auth_ok:
+                return
+
+            try:
+                cmd_rest = update.message.text.split(' ', 1)
+                self.notif_telegram_edit_time = float(cmd_rest[1])
+                await hlp.reply_msg(f"OK: {self.notif_telegram_edit_time}")
+
+            except Exception as e:
+                await hlp.reply_msg(f"Fail: {e}")
+
     async def event_handler(self):
         notif_type = os.getenv('NOTIFYTYPE')
         logger.info(f'Event OS: {os.environ}, notif type: {notif_type}')
@@ -388,12 +440,44 @@ class UpsMonit:
         await self.asyncWorker.work()
         logger.info(f'Main thread finishing')
 
+    async def send_telegram_notif_with_edit(self, notif, state_key):
+        to_edit = {}
+        t = time.time()
+
+        for chat_id in (self.notif_telegram_update_messages[state_key] if self.notif_telegram_edit_time > 0 else {}):
+            last_state_msg = self.notif_telegram_update_messages[state_key][chat_id]
+            last_msg = defvalkey(self.notif_telegram_last_messages, chat_id)
+            if not last_msg or not last_state_msg:
+                continue
+            if last_msg.msg.message_id != last_state_msg.msg.message_id:
+                continue
+            if t - last_state_msg.time >= self.notif_telegram_edit_time:
+                continue
+
+            to_edit[chat_id] = last_state_msg.msg
+
+        msgs = await self.notifier_telegram.send_telegram_notif(notif, to_edit)
+
+        self.update_last_telegram_messages(msgs, state_key)
+        for chat_id in msgs:
+            self.notif_telegram_update_messages[state_key][chat_id] = TelegramNotifMsg(msgs[chat_id], state_key, t)
+
+        logger.info(f'Messages: {msgs}')
+
     async def send_telegram_notif(self, notif):
-        await self.notifier_telegram.send_telegram_notif(notif)
+        msgs = await self.notifier_telegram.send_telegram_notif(notif)
+        self.update_last_telegram_messages(msgs)
+
+    def update_last_telegram_messages(self, msgs, state_key=None):
+        for chat_id in msgs:
+            self.notif_telegram_last_messages[chat_id] = TelegramNotifMsg(msgs[chat_id], state_key, time.time())
 
     def send_telegram_notif_on_main(self, notif):
         # asyncio.run_coroutine_threadsafe(self.send_telegram_notif(notif), self.main_loop)
         self.asyncWorker.enqueue_on_main(self.send_telegram_notif(notif), self.main_loop)
+
+    def send_telegram_notif_with_edit_on_main(self, *args):
+        self.asyncWorker.enqueue_on_main(self.send_telegram_notif_with_edit(*args), self.main_loop)
 
     def send_daemon_message(self, payload):
         if self.use_server:
@@ -457,7 +541,8 @@ class UpsMonit:
         logger.info(msg)
 
         self.add_log(msg, mtype='ups-event')
-        self.send_telegram_notif_on_main(msg)
+        # self.send_telegram_notif_on_main(msg)  # TODO: revert
+        self.send_telegram_notif_with_edit_on_main(msg, notif)
         self.notify_via_email_async(msg, f'UPS event {datetime.now().strftime("%m/%d/%Y, %H:%M:%S")}')
 
     def on_new_ups_state(self, r):
@@ -497,7 +582,7 @@ class UpsMonit:
             t_diff = t - self.last_ups_status_change
             status = json.dumps(self.shorten_status(self.last_ups_status) or {}, indent=2)
             txt_msg = f'UPS state report [{ups_state}, age={"%.2f" % t_diff}]: {status}'
-            self.send_telegram_notif_on_main(txt_msg)
+            self.send_telegram_notif_with_edit_on_main(txt_msg, ups_state)
             if do_report:
                 self.notify_via_email_async(txt_msg, f'UPS state change {datetime.now().strftime("%m/%d/%Y, %H:%M:%S")}')
             self.last_bat_report = t
@@ -516,6 +601,8 @@ class UpsMonit:
 
     def notify_via_email(self, txt_message: str, subject: str):
         if not self.email_notif_recipients:
+            return
+        if not self.do_email_reports:
             return
         return self.send_notify_email(self.email_notif_recipients, txt_message, subject)
 
