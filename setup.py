@@ -3,7 +3,7 @@ import sys
 from setuptools import setup
 from setuptools import find_packages
 
-version = '0.0.1'
+version = '0.0.2'
 
 # Please update tox.ini when modifying dependency version requirements
 install_requires = [
@@ -74,7 +74,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'ph4-ups-mon = upsmonit.ups:main',
+            'ph4-ups-mon = ph4upsmonit.ups:main',
         ],
     }
 )
