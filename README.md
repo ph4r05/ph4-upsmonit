@@ -84,6 +84,22 @@ Telegram bot supports also several commands, e.g., `/status` and `/full_status`,
 Note that Email notifier sends only state changes, while Telegram notifier sends also regular state updates when UPS is running on the battery.
 If email user is empty, email notifier is not use. Likewise, if bot API key is empty, telegram is not used.
 
+## Usage
+
+Send `/help` message to the Telegram bot
+
+```
+Help: 
+/start - register
+/stop - deregister
+/status - brief status
+/full_status - full status
+/log - log of latest events
+/noemail - disable email reporting
+/doemail - enable email reporting
+/doedit <time> - edit last status message instead of sending a new one. Time to edit the old message in seconds.
+```
+
 ## Dependencies
 This project uses monitoring tool library https://github.com/ph4r05/ph4-monitlib
 
