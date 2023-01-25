@@ -261,6 +261,7 @@ class UpsMonit:
 
     def start_server(self):
         self.tcp_comm.start()
+        logger.info(f'TCP server started @ {self.tcp_comm.server_host}:{self.tcp_comm.server_port}')
 
     def stop_server(self):
         self.tcp_comm.stop()
@@ -286,19 +287,19 @@ class UpsMonit:
         self.notifier_telegram.registered_chat_ids = self.args.chat_ids or []
         self.fifo_comm.fifo_path = self.args.server_fifo
         self.tcp_comm.server_port = self.args.server_port
-        self.main_loop = asyncio.get_event_loop()
 
         self.load_config()
         self.notifier_telegram.registered_chat_ids_set = set(self.notifier_telegram.registered_chat_ids)
 
         # Async switch
         try:
-            loop = asyncio.get_running_loop()
+            self.main_loop = asyncio.get_event_loop()
         except Exception as e:
-            loop = asyncio.new_event_loop()
+            self.main_loop = asyncio.new_event_loop()
+            logger.info(f'Created new runloop {self.main_loop}')
 
-        loop.set_debug(True)
-        loop.run_until_complete(self.main_async())
+        self.main_loop.set_debug(True)
+        self.main_loop.run_until_complete(self.main_async())
         self.is_running = False
 
     async def main_async(self):
@@ -312,14 +313,13 @@ class UpsMonit:
         try:
             if not self.ups_name:
                 raise Exception('UPS name to monitor is not defined')
-
             self.init_signals()
             self.start_worker_thread()
             self.start_status_thread()
             if self.use_fifo:
-                self.start_fifo_comm()
+                await self.main_loop.run_in_executor(None, self.start_fifo_comm)
             if self.use_server:
-                self.start_server()
+                await self.main_loop.run_in_executor(None, self.start_server)
             await self.start_bot_async()
 
             if self.start_error:
@@ -330,9 +330,9 @@ class UpsMonit:
 
         finally:
             if self.use_fifo:
-                try_fnc(lambda: self.fifo_comm.stop())
+                await self.main_loop.run_in_executor(None, try_fnc, lambda: self.fifo_comm.stop())
             if self.use_server:
-                try_fnc(lambda: self.stop_server())
+                await self.main_loop.run_in_executor(None, try_fnc, lambda: self.stop_server())
             await self.stop_bot()
 
         return r
@@ -392,8 +392,8 @@ class UpsMonit:
         await self.notifier_telegram.send_telegram_notif(notif)
 
     def send_telegram_notif_on_main(self, notif):
-        coro = self.send_telegram_notif(notif)
-        self.asyncWorker.enqueue(coro)
+        # asyncio.run_coroutine_threadsafe(self.send_telegram_notif(notif), self.main_loop)
+        self.asyncWorker.enqueue_on_main(self.send_telegram_notif(notif), self.main_loop)
 
     def send_daemon_message(self, payload):
         if self.use_server:
@@ -431,7 +431,7 @@ class UpsMonit:
                     self.on_ups_event(js)
 
             except Exception as e:
-                logger.warning(f'Exception in processing server fifo: {e}', exc_info=e)
+                logger.warning(f'Exception in processing server message: {e}', exc_info=e)
 
     def add_log(self, msg, mtype='-'):
         time_fmt = datetime.now().strftime("%m/%d/%Y, %H:%M:%S")
