@@ -1,6 +1,8 @@
-#!/usr/bin/env sh
+#!/usr/bin/env bash
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 set -ex
 
+cd "${SCRIPT_DIR}"
 cp config.json /etc/nut/upsmon-config.json
 chmod 0640 /etc/nut/upsmon-config.json
 chown nut:nut /etc/nut/upsmon-config.json
