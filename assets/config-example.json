@@ -1,5 +1,5 @@
 {
-  "ups_name": "servers",
+  "ups_name": ["ups"],
   "bot_url": "t.me/monit_bot",
   "bot_apikey": "24423424234:AAEasdasdasasdasdasd",
   "jwt_key": "jwtkey",

@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import platform
+import re
 import signal
 import threading
 import time
@@ -81,6 +82,17 @@ class TelegramNotifMsg:
         return f'TelegramNotifMsg({self.msg}, {self.mtype}, {self.time})'
 
 
+class UpsState:
+    def __init__(self):
+        self.last_ups_status = None
+        self.last_ups_status_time = 0
+        self.is_on_bat = False
+        self.last_ups_state_txt = None
+        self.last_ups_status_change = 0
+        self.last_bat_report = 0
+        self.last_norm_report = 0
+
+
 class UpsMonit:
     def __init__(self):
         self.args = {}
@@ -106,22 +118,17 @@ class UpsMonit:
 
         self.status_thread = None
         self.status_thread_last_check = 0
-        self.last_ups_status = None
-        self.last_ups_status_time = 0
-
         self.main_loop = None
         self.start_error = None
 
         self.do_email_reports = True
         self.notif_telegram_edit_time = 5 * 60
-        self.is_on_bat = False
-        self.last_ups_state_txt = None
-        self.last_ups_status_change = 0
-        self.last_bat_report = 0
-        self.last_norm_report = 0
         self.last_cmd_status = 0
+
         self.event_log_deque = collections.deque([], 5_000)
         self.log_report_len = 7
+
+        self.ups_statuses = collections.defaultdict(lambda: UpsState())
 
     def argparser(self):
         parser = argparse.ArgumentParser(description='UPS monitoring')
@@ -130,7 +137,7 @@ class UpsMonit:
                             help='enables debug mode')
         parser.add_argument('-c', '--config', dest='config',
                             help='Config file to load')
-        parser.add_argument('-n', '--name', dest='ups_name', default='servers',
+        parser.add_argument('-n', '--name', dest='ups_name',
                             help='UPS name to check')
         parser.add_argument('-e', '--event', dest='event', action='store_const', const=True,
                             help='Event from the nut daemon')
@@ -144,6 +151,8 @@ class UpsMonit:
                             help='UDP server port')
         parser.add_argument('-f', '--fifo', dest='server_fifo', default='/tmp/ups-monitor-fifo',
                             help='Server fifo')
+        parser.add_argument('-l', '--log', dest='json_log',
+                            help='File where to store JSON logs from events')
         parser.add_argument('message', nargs=argparse.ZERO_OR_MORE,
                             help='Text message from notifier')
         return parser
@@ -210,6 +219,9 @@ class UpsMonit:
         self.asyncWorker.stop()
         self.worker.stop()
 
+    def get_ups_state(self, ups_name) -> UpsState:
+        return self.ups_statuses[ups_name]
+
     def init_signals(self):
         stop_signals = (signal.SIGINT, signal.SIGTERM, signal.SIGABRT) if platform.system() != "Windows" else []
         loop = asyncio.get_event_loop()
@@ -257,15 +269,19 @@ class UpsMonit:
                     if t - self.status_thread_last_check < 2.5:
                         continue
 
-                    r = self.get_ups_state()
-                    self.last_ups_status = r
-                    self.last_ups_status_time = t
+                    for ups_name in self.get_ups_names():
+                        r = self.fetch_ups_state(ups_name)
+                        st = self.get_ups_state(ups_name)
+
+                        st.last_ups_status = r
+                        st.last_ups_status_time = t
+                        st.last_ups_status['meta.time_check'] = t
+                        st.last_ups_status['meta.dt_check'] = datetime.now().strftime("%m/%d/%Y, %H:%M:%S")
+                        if 'battery.runtime' in r:
+                            st.last_ups_status['meta.battery.runtime.m'] = round(100 * (r['battery.runtime'] / 60)) / 100
+                        try_fnc(lambda: self.on_new_ups_state(ups_name, st.last_ups_status))
+
                     self.status_thread_last_check = t
-                    self.last_ups_status['meta.time_check'] = t
-                    self.last_ups_status['meta.dt_check'] = datetime.now().strftime("%m/%d/%Y, %H:%M:%S")
-                    if 'battery.runtime' in r:
-                        self.last_ups_status['meta.battery.runtime.m'] = round(100 * (r['battery.runtime'] / 60)) / 100
-                    try_fnc(lambda: self.on_new_ups_state(self.last_ups_status))
 
                 except Exception as e:
                     logger.error(f'Status thread exception: {e}', exc_info=e)
@@ -366,10 +382,15 @@ class UpsMonit:
                 return
 
             self.last_cmd_status = time.time()
-            r = self.shorten_status(self.last_ups_status)
-            status_age = time.time() - self.last_ups_status_time
-            logger.info(f"Sending status response with age {status_age} s: {r}")
-            await hlp.reply_msg(f"Status: {json.dumps(r, indent=2)}, {'%.2f' % status_age} s old")
+            acc = []
+            for ups in self.get_ups_names():
+                st = self.get_ups_state(ups)
+                r = self.shorten_status(st.last_ups_status)
+                r['meta.status_age'] = time.time() - st.last_ups_status_time
+                acc.append(r)
+
+            logger.info(f"Sending status s: {acc}")
+            await hlp.reply_msg(f"Status: {json.dumps(acc, indent=2)}")
 
     async def bot_cmd_full_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with self.notifier_telegram.handler_helper("full_status", update, context) as hlp:
@@ -377,10 +398,15 @@ class UpsMonit:
                 return
 
             self.last_cmd_status = time.time()
-            r = self.last_ups_status
-            status_age = time.time() - self.last_ups_status_time
-            logger.info(f"Sending status response with age {status_age} s: {self.last_ups_status}")
-            await hlp.reply_msg(f"Status: {json.dumps(r, indent=2)}, {'%.2f' % status_age} s old")
+            acc = []
+            for ups in self.get_ups_names():
+                st = self.get_ups_state(ups)
+                r = dict(st.last_ups_status or {})
+                r['meta.status_age'] = time.time() - st.last_ups_status_time
+                acc.append(r)
+
+            logger.info(f"Sending full status response: {acc}")
+            await hlp.reply_msg(f"Status: {json.dumps(acc, indent=2)}")
 
     async def bot_cmd_log(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         def _txt_log(r):
@@ -536,59 +562,91 @@ class UpsMonit:
         if isinstance(msg, list):
             msg = try_fnc(lambda: ' '.join(msg))
 
-        status = json.dumps(self.shorten_status(self.last_ups_status) or {}, indent=2)
-        msg = f'UPS event: {notif}, message: {msg}, status: {status}'
+        self.wait_next_status_check()
+        ups_name = self._extract_ups_name_from_msg(msg)
+        st = self.get_ups_state(ups_name)
+
+        status = json.dumps(self.shorten_status(st.last_ups_status) or {}, indent=2)
+        msg = f'UPS event: {ups_name}: {notif}, message: {msg}, status: {status}'
         logger.info(msg)
 
         self.add_log(msg, mtype='ups-event')
+        self.add_log_rec({
+            'evt': 'ups-event',
+            'ups_name': ups_name,
+            'notif': notif,
+            'msg': msg,
+            'status': st.last_ups_status,
+            'last_bat_report': st.last_bat_report,
+        })
+
         # self.send_telegram_notif_on_main(msg)  # TODO: revert
         self.send_telegram_notif_with_edit_on_main(msg, notif)
-        self.notify_via_email_async(msg, f'UPS event {datetime.now().strftime("%m/%d/%Y, %H:%M:%S")}')
+        self.notify_via_email_async(msg, f'UPS event {ups_name} - {datetime.now().strftime("%m/%d/%Y, %H:%M:%S")}')
 
-    def on_new_ups_state(self, r):
+    def on_new_ups_state(self, ups_name, r):
         """
         https://github.com/networkupstools/nut/blob/03c3bbe8df9a2caf3c09c120ae7045d35af99b76/drivers/apcupsd-ups.h
         """
 
         t = time.time()
+        st = self.get_ups_state(ups_name)
         ups_state = r['ups.status']
 
         state_comp = ups_state.split(' ', 2)
         is_online = state_comp[0] == 'OL'
         is_charging = ups_state == 'OL CHRG'
         is_on_bat = not is_online and not is_charging  # simplification
+        state_key = f'{ups_name}:{ups_state}'
 
         do_report = False
         in_state_report = False
-        if self.last_ups_state_txt != ups_state:
-            old_state_change = self.last_ups_status_change
-            logger.info(f'Detected UPS change detected {ups_state}, last state change: {t - old_state_change}')
-            self.last_ups_state_txt = ups_state
-            self.last_ups_status_change = t
-            self.is_on_bat = is_on_bat
+        if st.last_ups_state_txt != ups_state:
+            old_state_change = st.last_ups_status_change
+            logger.info(f'Detected UPS change detected {ups_name}: {ups_state}, last state change: {t - old_state_change}')
+            st.last_ups_state_txt = ups_state
+            st.last_ups_status_change = t
+            st.is_on_bat = is_on_bat
             do_report = True
 
-            status = json.dumps(self.shorten_status(self.last_ups_status) or {}, indent=2)
-            msg = f'UPS state report [{ups_state}, age={"%.2f" % (t - self.last_bat_report)}]: {status}'
+            status = json.dumps(self.shorten_status(st.last_ups_status) or {}, indent=2)
+            msg = f'UPS state report for {ups_name} [{ups_state}, age={"%.2f" % (t - st.last_bat_report)}]: {status}'
             self.add_log(msg, mtype='ups-change')
+            self.add_log_rec({
+                'evt': 'ups-state',
+                'ups_name': ups_name,
+                'ups_state': ups_state,
+                'status': st.last_ups_status,
+                'last_bat_report': st.last_bat_report,
+            })
 
-        if self.is_on_bat:
-            t_diff = t - self.last_bat_report
-            is_fast = self.last_bat_report == 0 or t_diff < 5 * 60
+        if st.is_on_bat:
+            t_diff = t - st.last_bat_report
+            is_fast = st.last_bat_report == 0 or t_diff < 5 * 60
             in_state_report = (is_fast and t_diff >= self.report_interval_fast) or \
                               (not is_fast and t_diff >= self.report_interval_slow)
 
         if do_report or in_state_report:
-            t_diff = t - self.last_ups_status_change
-            status = json.dumps(self.shorten_status(self.last_ups_status) or {}, indent=2)
-            txt_msg = f'UPS state report [{ups_state}, age={"%.2f" % t_diff}]: {status}'
-            self.send_telegram_notif_with_edit_on_main(txt_msg, ups_state)
+            t_diff = t - st.last_ups_status_change
+            status = json.dumps(self.shorten_status(st.last_ups_status) or {}, indent=2)
+            txt_msg = f'UPS state report for {ups_name} [{ups_state}, age={"%.2f" % t_diff}]: {status}'
+            self.send_telegram_notif_with_edit_on_main(txt_msg, state_key)
             if do_report:
-                self.notify_via_email_async(txt_msg, f'UPS state change {datetime.now().strftime("%m/%d/%Y, %H:%M:%S")}')
-            self.last_bat_report = t
+                self.notify_via_email_async(txt_msg, f'UPS state change {ups_name} {datetime.now().strftime("%m/%d/%Y, %H:%M:%S")}')
+            st.last_bat_report = t
 
-    def get_ups_state(self):
-        runner = get_runner([f'/usr/bin/upsc', self.ups_name], shell=False)
+    def plan_status_check(self):
+        self.status_thread_last_check = 0
+
+    def wait_next_status_check(self, timeout=10):
+        self.plan_status_check()
+        tstart = time.time()
+        while self.status_thread_last_check == 0 and (timeout is None or time.time() - tstart < timeout):
+            time.sleep(0.1)
+        return self.status_thread_last_check > 0
+
+    def fetch_ups_state(self, name=None):
+        runner = get_runner([f'/usr/bin/upsc', name], shell=False)
         runner.start(wait_running=True, timeout=3.0)
         runner.wait(timeout=3.0)
 
@@ -608,6 +666,22 @@ class UpsMonit:
 
     def send_notify_email(self, recipients: List[str], txt_message: str, subject: str):
         self.notifier_email.send_notify_email(recipients, txt_message, subject)
+
+    def add_log_rec(self, rec):
+        time_fmt = datetime.now().strftime("%m/%d/%Y, %H:%M:%S")
+        time_now = time.time()
+        return self.add_log_line(json.dumps({
+            'time': time_now,
+            'time_fmt': time_fmt,
+            **rec,
+        }))
+
+    def add_log_line(self, line):
+        if not self.args.json_log:
+            return
+        with open(self.args.json_log, 'a+') as fh:
+            fh.write(line)
+            fh.write("\n")
 
     def _get_tuple(self, key, dct):
         return key, dct[key]
@@ -633,6 +707,22 @@ class UpsMonit:
         except Exception as e:
             logger.warning(f'Exception shortening the status {e}', exc_info=e)
             return status
+
+    def get_ups_names(self):
+        return [self.ups_name] if isinstance(self.ups_name, str) else self.ups_name
+
+    def _match_ups_name(self, candidate):
+        names = self.get_ups_names()
+        for cname in names:
+            if cname in (candidate, f'{candidate}@localhost') or candidate in (cname, f'{cname}@localhost'):
+                return cname
+        return candidate
+
+    def _extract_ups_name_from_msg(self, msg):
+        m = re.match(r'.*UPS\s(.+?)\s.*', msg)
+        if m:
+            return self._match_ups_name(m.group(1))
+        return None
 
 
 def main():
