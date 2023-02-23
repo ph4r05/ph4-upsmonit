@@ -277,6 +277,7 @@ class UpsMonit:
                         st.last_ups_status_time = t
                         st.last_ups_status['meta.time_check'] = t
                         st.last_ups_status['meta.dt_check'] = datetime.now().strftime("%m/%d/%Y, %H:%M:%S")
+                        st.last_ups_status['meta.ups_name'] = ups_name
                         if 'battery.runtime' in r:
                             st.last_ups_status['meta.battery.runtime.m'] = round(100 * (r['battery.runtime'] / 60)) / 100
                         try_fnc(lambda: self.on_new_ups_state(ups_name, st.last_ups_status))
@@ -686,8 +687,8 @@ class UpsMonit:
         except Exception as e:
             logger.warning(f'Error writing log to the file {e}', exc_info=e)
 
-    def _get_tuple(self, key, dct):
-        return key, dct[key]
+    def _get_tuple(self, key, dct, default=None):
+        return key, dct[key] if key in dct else default
 
     def shorten_status(self, status):
         if not status:
@@ -705,6 +706,8 @@ class UpsMonit:
                 self._get_tuple('meta.battery.runtime.m', status),
                 self._get_tuple('meta.time_check', status),
                 self._get_tuple('meta.dt_check', status),
+                self._get_tuple('meta.ups_name', status),
+                self._get_tuple('meta.status_age', status),
             ])
             return r
         except Exception as e:
