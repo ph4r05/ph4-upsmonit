@@ -678,9 +678,13 @@ class UpsMonit:
     def add_log_line(self, line):
         if not self.args.json_log:
             return
-        with open(self.args.json_log, 'a+') as fh:
-            fh.write(line)
-            fh.write("\n")
+
+        try:
+            with open(self.args.json_log, 'a+') as fh:
+                fh.write(line)
+                fh.write("\n")
+        except Exception as e:
+            logger.warning(f'Error writing log to the file {e}', exc_info=e)
 
     def _get_tuple(self, key, dct):
         return key, dct[key]
