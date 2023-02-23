@@ -11,6 +11,9 @@ cp ph4upsmon.sh ph4upsmon-notif.sh /etc/nut/
 chmod 0755 /etc/nut/ph4upsmon.sh
 chmod 0755 /etc/nut/ph4upsmon-notif.sh
 
+touch /var/log/ph4upsmon.json
+chown nut:nut /var/log/ph4upsmon.json
+
 cp ph4upsmon.service /etc/systemd/system/ph4upsmon.service
 systemctl daemon-reload
 

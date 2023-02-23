@@ -16,7 +16,7 @@ Type=simple
 Environment=DNS_PUBLIC=tcp
 Environment=TORSOCKS_ALLOW_INBOUND=1
 
-ExecStart=/etc/nut/ph4upsmon.sh
+ExecStart=/etc/nut/ph4upsmon.sh --log /var/log/ph4upsmon.json
 StandardOutput=append:/var/log/ph4upsmon.log
 StandardError=append:/var/log/ph4upsmon.log
 # Another alternative for logging is to execute ExecStart as /bin/bash -c ""

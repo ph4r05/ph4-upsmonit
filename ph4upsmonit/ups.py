@@ -575,7 +575,6 @@ class UpsMonit:
             'evt': 'ups-event',
             'ups_name': ups_name,
             'notif': notif,
-            'msg': msg,
             'status': st.last_ups_status,
             'last_bat_report': st.last_bat_report,
         })
