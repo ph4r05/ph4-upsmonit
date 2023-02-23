@@ -475,8 +475,8 @@ class UpsMonit:
             last_msg = defvalkey(self.notif_telegram_last_messages, chat_id)
             if not last_msg or not last_state_msg:
                 continue
-            if last_msg.msg.message_id != last_state_msg.msg.message_id:
-                continue
+            # if last_msg.msg.message_id != last_state_msg.msg.message_id:
+            #     continue
             if t - last_state_msg.time >= self.notif_telegram_edit_time:
                 continue
 
