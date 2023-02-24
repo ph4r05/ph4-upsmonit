@@ -14,6 +14,8 @@ import signal
 import threading
 import time
 from datetime import datetime
+from functools import partial
+from operator import is_not
 from typing import List
 
 import coloredlogs
@@ -118,6 +120,7 @@ class UpsMonit:
 
         self.status_thread = None
         self.status_thread_last_check = 0
+        self.status_thread_check_interval = 2.5
         self.main_loop = None
         self.start_error = None
 
@@ -266,21 +269,11 @@ class UpsMonit:
             while self.is_running:
                 try:
                     t = time.time()
-                    if t - self.status_thread_last_check < 2.5:
+                    if t - self.status_thread_last_check < self.status_thread_check_interval:
                         continue
 
                     for ups_name in self.get_ups_names():
-                        r = self.fetch_ups_state(ups_name)
-                        st = self.get_ups_state(ups_name)
-
-                        st.last_ups_status = r
-                        st.last_ups_status_time = t
-                        st.last_ups_status['meta.time_check'] = t
-                        st.last_ups_status['meta.dt_check'] = datetime.now().strftime("%m/%d/%Y, %H:%M:%S")
-                        st.last_ups_status['meta.ups_name'] = ups_name
-                        if 'battery.runtime' in r:
-                            st.last_ups_status['meta.battery.runtime.m'] = round(100 * (r['battery.runtime'] / 60)) / 100
-                        try_fnc(lambda: self.on_new_ups_state(ups_name, st.last_ups_status))
+                        self._ups_status_check_internal(ups_name, t)
 
                     self.status_thread_last_check = t
 
@@ -295,6 +288,30 @@ class UpsMonit:
         self.status_thread = threading.Thread(target=status_internal, args=())
         self.status_thread.daemon = False
         self.status_thread.start()
+
+    def _ups_status_check_internal(self, ups_name, t=None):
+        t = t or time.time()
+        st = self.get_ups_state(ups_name)
+        r = {}
+
+        for attempt in range(3):
+            try:
+                r = self.fetch_ups_state(ups_name)
+                break
+            except Exception as e:
+                r = {
+                    'meta.error': str(e),
+                }
+
+        st.last_ups_status = r
+        st.last_ups_status_time = t
+        st.last_ups_status['meta.time_check'] = t
+        st.last_ups_status['meta.dt_check'] = datetime.now().strftime("%Y-%m-%d, %H:%M:%S")
+        st.last_ups_status['meta.ups_name'] = ups_name
+        if 'battery.runtime' in r:
+            st.last_ups_status['meta.battery.runtime.m'] = round(100 * (defvalkey(r, 'battery.runtime', 0) / 60)) / 100
+
+        try_fnc(lambda: self.on_new_ups_state(ups_name, st.last_ups_status))
 
     def start_fifo_comm(self):
         self.fifo_comm.start()
@@ -545,7 +562,7 @@ class UpsMonit:
                 logger.warning(f'Exception in processing server message: {e}', exc_info=e)
 
     def add_log(self, msg, mtype='-'):
-        time_fmt = datetime.now().strftime("%m/%d/%Y, %H:%M:%S")
+        time_fmt = datetime.now().strftime("%Y-%m-%d, %H:%M:%S")
         time_now = time.time()
 
         self.event_log_deque.append({
@@ -582,7 +599,7 @@ class UpsMonit:
 
         # self.send_telegram_notif_on_main(msg)  # TODO: revert
         self.send_telegram_notif_with_edit_on_main(msg, notif)
-        self.notify_via_email_async(msg, f'UPS event {ups_name} - {datetime.now().strftime("%m/%d/%Y, %H:%M:%S")}')
+        self.notify_via_email_async(msg, f'UPS event {ups_name} - {datetime.now().strftime("%Y-%m-%d, %H:%M:%S")}')
 
     def on_new_ups_state(self, ups_name, r):
         """
@@ -632,7 +649,7 @@ class UpsMonit:
             txt_msg = f'UPS state report for {ups_name} [{ups_state}, age={"%.2f" % t_diff}]: {status}'
             self.send_telegram_notif_with_edit_on_main(txt_msg, state_key)
             if do_report:
-                self.notify_via_email_async(txt_msg, f'UPS state change {ups_name} {datetime.now().strftime("%m/%d/%Y, %H:%M:%S")}')
+                self.notify_via_email_async(txt_msg, f'UPS state change {ups_name} {datetime.now().strftime("%Y-%m-%d, %H:%M:%S")}')
             st.last_bat_report = t
 
     def plan_status_check(self):
@@ -668,7 +685,7 @@ class UpsMonit:
         self.notifier_email.send_notify_email(recipients, txt_message, subject)
 
     def add_log_rec(self, rec):
-        time_fmt = datetime.now().strftime("%m/%d/%Y, %H:%M:%S")
+        time_fmt = datetime.now().strftime("%Y-%m-%d, %H:%M:%S")
         time_now = time.time()
         return self.add_log_line(json.dumps({
             'time': time_now,
@@ -690,25 +707,29 @@ class UpsMonit:
     def _get_tuple(self, key, dct, default=None):
         return key, dct[key] if key in dct else default
 
+    def _get_tuple_ex(self, key, dct):
+        return (key, dct[key]) if key in dct else None
+
     def shorten_status(self, status):
         if not status:
             return status
         try:
-            r = collections.OrderedDict([
-                self._get_tuple('battery.charge', status),
-                self._get_tuple('battery.runtime', status),
-                self._get_tuple('battery.voltage', status),
-                self._get_tuple('input.voltage', status),
-                self._get_tuple('output.voltage', status),
-                self._get_tuple('ups.load', status),
-                self._get_tuple('ups.status', status),
-                self._get_tuple('ups.test.result', status),
-                self._get_tuple('meta.battery.runtime.m', status),
-                self._get_tuple('meta.time_check', status),
-                self._get_tuple('meta.dt_check', status),
-                self._get_tuple('meta.ups_name', status),
-                self._get_tuple('meta.status_age', status),
-            ])
+            r = collections.OrderedDict(filter(partial(is_not, None), [
+                self._get_tuple_ex('battery.charge', status),
+                self._get_tuple_ex('battery.runtime', status),
+                self._get_tuple_ex('battery.voltage', status),
+                self._get_tuple_ex('input.voltage', status),
+                self._get_tuple_ex('output.voltage', status),
+                self._get_tuple_ex('ups.load', status),
+                self._get_tuple_ex('ups.status', status),
+                self._get_tuple_ex('ups.test.result', status),
+                self._get_tuple_ex('meta.battery.runtime.m', status),
+                self._get_tuple_ex('meta.time_check', status),
+                self._get_tuple_ex('meta.dt_check', status),
+                self._get_tuple_ex('meta.ups_name', status),
+                self._get_tuple_ex('meta.status_age', status),
+                self._get_tuple_ex('meta.error', status),
+            ]))
             return r
         except Exception as e:
             logger.warning(f'Exception shortening the status {e}', exc_info=e)
