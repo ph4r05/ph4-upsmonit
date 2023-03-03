@@ -120,7 +120,7 @@ class UpsMonit:
 
         self.status_thread = None
         self.status_thread_last_check = 0
-        self.status_thread_check_interval = 2.5
+        self.status_thread_check_interval = 2.0
         self.main_loop = None
         self.start_error = None
 
@@ -664,6 +664,8 @@ class UpsMonit:
 
     def fetch_ups_state(self, name=None):
         runner = get_runner([f'/usr/bin/upsc', name], shell=False)
+        runner.capture_stdout_buffer = -1
+        runner.capture_stderr_buffer = -1
         runner.start(wait_running=True, timeout=3.0)
         runner.wait(timeout=3.0)
 

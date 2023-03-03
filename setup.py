@@ -13,7 +13,7 @@ install_requires = [
     'shellescape',
     'asyncio',
     'coloredlogs',
-    'ph4-runner',
+    'ph4-runner>=0.0.5',
     'requests',
     'jsonpath_ng',
     'PyJWT==2.6.0',
