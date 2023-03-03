@@ -147,7 +147,7 @@ class UpsMonit:
 
         self.status_thread = None
         self.status_thread_last_check = 0
-        self.status_thread_check_interval = 2.0
+        self.status_thread_check_interval = 1.5
         self.main_loop = None
         self.start_error = None
 
@@ -159,6 +159,7 @@ class UpsMonit:
         self.log_report_len = 7
 
         self.ups_statuses = collections.defaultdict(lambda: UpsState())
+        self.nut_clients = collections.defaultdict(lambda: None)
 
     def argparser(self):
         parser = argparse.ArgumentParser(description='UPS monitoring')
@@ -733,8 +734,22 @@ class UpsMonit:
 
     def fetch_ups_state_nut(self, name, cfg):
         cfg = cfg or UpsMonConfig.from_name(name)
+        client = self.nut_clients[cfg.host]
+
+        # Reuse cached client
+        if client:
+            try:
+                r = self._nut_fetch_ups_state(client, cfg.name)
+                return r
+            except:
+                pass
+
         client = PyNUTClient(host=cfg.host, login=cfg.user, password=cfg.passwd, timeout=3.0)
-        r = client.list_vars(cfg.name)
+        self.nut_clients[cfg.host] = client
+        return self._nut_fetch_ups_state(client, cfg.name)
+
+    def _nut_fetch_ups_state(self, client, name):
+        r = client.list_vars(name)
         r = sanitize_ups_rec(r)
         return r
 
