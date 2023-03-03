@@ -20,6 +20,7 @@ from typing import List
 
 import coloredlogs
 import jwt
+from nut2 import PyNUTClient
 from ph4monitlib import jsonpath, try_fnc, get_runner, defvalkey
 from ph4monitlib.comm import FiFoComm, TcpComm
 from ph4monitlib.notif import NotifyEmail
@@ -33,44 +34,48 @@ logger = logging.getLogger(__name__)
 coloredlogs.install(level=logging.INFO)
 
 
-def parse_ups(log: str):
-    float_fields = [
-        'battery.charge',
-        'battery.charge.low',
-        'battery.charge.warning',
-        'battery.runtime',
-        'battery.runtime.low',
-        'battery.voltage',
-        'battery.voltage.nominal',
-        'driver.parameter.pollfreq',
-        'driver.parameter.pollinterval',
-        'input.transfer.high',
-        'input.transfer.low',
-        'input.voltage',
-        'input.voltage.nominal',
-        'output.voltage',
-        'ups.delay.shutdown',
-        'ups.delay.start',
-        'ups.load',
-        'ups.realpower.nominal',
-        'ups.timer.shutdown',
-        'ups.timer.start',
-    ]
+ups_float_fields = {
+    'battery.charge',
+    'battery.charge.low',
+    'battery.charge.warning',
+    'battery.runtime',
+    'battery.runtime.low',
+    'battery.voltage',
+    'battery.voltage.nominal',
+    'driver.parameter.pollfreq',
+    'driver.parameter.pollinterval',
+    'input.transfer.high',
+    'input.transfer.low',
+    'input.voltage',
+    'input.voltage.nominal',
+    'output.voltage',
+    'ups.delay.shutdown',
+    'ups.delay.start',
+    'ups.load',
+    'ups.realpower.nominal',
+    'ups.timer.shutdown',
+    'ups.timer.start',
+}
 
+
+def sanitize_ups_rec(inp):
+    for k in inp:
+        if k not in ups_float_fields:
+            continue
+        try:
+            inp[k] = float(inp[k])
+        except Exception as e:
+            logger.warning(f'Float conversion failed for {k}', exc_info=e)
+    return inp
+
+
+def parse_ups(log: str):
     ret = {}
-    set_float_fields = set(float_fields)
     lines = log.split('\n')
     for ix, line in enumerate(lines):
         p1, p2 = [x.strip() for x in line.split(':', 1)]
-        val = p2
-
-        if p1 in set_float_fields:
-            try:
-                val = float(p2)
-            except Exception as e:
-                logger.warning(f'Float conversion failed for {p1}', exc_info=e)
-
-        ret[p1] = val
+        ret[p1] = p2
+    ret = sanitize_ups_rec(ret)
     return ret
 
 
@@ -82,6 +87,26 @@ class TelegramNotifMsg:
 
     def __repr__(self) -> str:
         return f'TelegramNotifMsg({self.msg}, {self.mtype}, {self.time})'
+
+
+class UpsMonConfig:
+    def __init__(self, rec):
+        self.oname = rec['name']
+        self.name = self.oname
+        self.host = None
+
+        if '@' in self.name:
+            self.name, self.host = self.name.split('@', 1)
+
+        self.host = defvalkey(rec, 'host', self.host or 'localhost')
+        self.port = defvalkey(rec, 'port')
+        self.user = defvalkey(rec, 'user')
+        self.passwd = defvalkey(rec, 'pass')
+        self.settings = rec
+
+    @staticmethod
+    def from_name(name):
+        return UpsMonConfig({'name': name})
 
 
 class UpsState:
@@ -99,8 +124,10 @@ class UpsMonit:
     def __init__(self):
         self.args = {}
         self.ups_name = 'servers'
+        self.ups_config: dict[str, UpsMonConfig] = {}
         self.config = {}
         self.jwt_key = None
+        self.use_nutlib = None
 
         self.email_notif_recipients = []
         self.use_server = True
@@ -156,6 +183,8 @@ class UpsMonit:
                             help='Server fifo')
         parser.add_argument('-l', '--log', dest='json_log',
                             help='File where to store JSON logs from events')
+        parser.add_argument('--nlib', dest='use_nutlib', action='store_const', const=True,
+                            help='Use nut2 network lib')
         parser.add_argument('message', nargs=argparse.ZERO_OR_MORE,
                             help='Text message from notifier')
         return parser
@@ -164,6 +193,7 @@ class UpsMonit:
         self.ups_name = os.getenv('UPS_NAME', None) or self.args.ups_name
         self.jwt_key = os.getenv('JWT_KEY', None)
         self.notifier_telegram.bot_apikey = os.getenv('BOT_APIKEY', None)
+        self.use_nutlib = self.args.use_nutlib or False
 
         if not self.args.config:
             return
@@ -183,7 +213,7 @@ class UpsMonit:
 
             ups_name = jsonpath('$.ups_name', self.config, True)
             if not self.ups_name:
-                self.ups_name = ups_name
+                self.process_ups_name_config(ups_name)
 
             server_port = jsonpath('$.server_port', self.config, True)
             if not self.tcp_comm.server_port:
@@ -212,9 +242,25 @@ class UpsMonit:
             self.notifier_email.server = jsonpath('$.email_server', self.config, True)
             self.notifier_email.user = jsonpath('$.email_user', self.config, True)
             self.notifier_email.passwd = jsonpath('$.email_pass', self.config, True)
+            self.use_nutlib |= jsonpath('$.use_nutlib', self.config, True) or False
 
         except Exception as e:
             logger.error("Could not load config %s at %s" % (e, self.args.config), exc_info=e)
+
+    def process_ups_name_config(self, ups_name):
+        if not isinstance(ups_name, list):
+            self.ups_name = ups_name
+            return
+
+        self.ups_name = []
+        for rec in ups_name:
+            if isinstance(rec, str):
+                self.ups_name.append(rec)
+                continue
+
+            c = UpsMonConfig(rec)
+            self.ups_name.append(c.name)
+            self.ups_config[c.oname] = c
 
     def _stop_app_on_signal(self):
         logger.info(f'Signal received')
@@ -294,6 +340,7 @@ class UpsMonit:
         st = self.get_ups_state(ups_name)
         r = {}
 
+        last_err = None
         for attempt in range(3):
             try:
                 r = self.fetch_ups_state(ups_name)
@@ -302,6 +349,9 @@ class UpsMonit:
                 r = {
                     'meta.error': str(e),
                 }
+
+        if last_err:
+            logger.info(f'Exception in fetch: {last_err}', exc_info=last_err)
 
         st.last_ups_status = r
         st.last_ups_status_time = t
@@ -355,7 +405,7 @@ class UpsMonit:
             self.main_loop = asyncio.new_event_loop()
             logger.info(f'Created new runloop {self.main_loop}')
 
-        self.main_loop.set_debug(True)
+        # self.main_loop.set_debug(True)
         self.main_loop.run_until_complete(self.main_async())
         self.is_running = False
 
@@ -663,6 +713,14 @@ class UpsMonit:
         return self.status_thread_last_check > 0
 
     def fetch_ups_state(self, name=None):
+        cfg = self.ups_config[name] if name in self.ups_config else None
+        use_nut = self.use_nutlib or cfg
+
+        if not use_nut:
+            return self.fetch_ups_state_upsc(name)
+        return self.fetch_ups_state_nut(name, cfg)
+
+    def fetch_ups_state_upsc(self, name):
         runner = get_runner([f'/usr/bin/upsc', name], shell=False)
         runner.capture_stdout_buffer = -1
         runner.capture_stderr_buffer = -1
@@ -672,6 +730,13 @@ class UpsMonit:
         out = "\n".join(runner.out_acc)
         ret = parse_ups(out)
         return ret
+
+    def fetch_ups_state_nut(self, name, cfg):
+        cfg = cfg or UpsMonConfig.from_name(name)
+        client = PyNUTClient(host=cfg.host, login=cfg.user, password=cfg.passwd, timeout=3.0)
+        r = client.list_vars(cfg.name)
+        r = sanitize_ups_rec(r)
+        return r
 
     def notify_via_email_async(self, txt_message: str, subject: str):
         self.worker.enqueue(lambda: self.notify_via_email(txt_message, subject))

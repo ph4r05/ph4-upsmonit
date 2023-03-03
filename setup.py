@@ -18,6 +18,7 @@ install_requires = [
     'jsonpath_ng',
     'PyJWT==2.6.0',
     'ph4-monitlib>=0.0.3',
+    'nut2',
 ]
 
 dev_extras = [
