@@ -16,8 +16,9 @@ install_requires = [
     'ph4-runner>=0.0.5',
     'requests',
     'jsonpath_ng',
+    'pyyaml==6.0.1',
     'PyJWT==2.6.0',
-    'ph4-monitlib>=0.0.3',
+    'ph4-monitlib>=0.0.5',
     'nut2',
 ]
 

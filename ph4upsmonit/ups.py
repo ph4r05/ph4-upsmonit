@@ -20,8 +20,9 @@ from typing import List
 
 import coloredlogs
 import jwt
+import yaml
 from nut2 import PyNUTClient
-from ph4monitlib import jsonpath, try_fnc, get_runner, defvalkey
+from ph4monitlib import coalesce, jsonpath, try_fnc, get_runner, defvalkey
 from ph4monitlib.comm import FiFoComm, TcpComm
 from ph4monitlib.notif import NotifyEmail
 from ph4monitlib.tbot import TelegramBot
@@ -141,13 +142,13 @@ class UpsMonit:
         self.fifo_comm = FiFoComm(handler=self.process_fifo_data, running_fnc=lambda: self.is_running)
         self.tcp_comm = TcpComm(handler=self.process_server_data, running_fnc=lambda: self.is_running)
         self.notifier_email = NotifyEmail()
-        self.notifier_telegram = TelegramBot()
+        self.notifier_telegram = TelegramBot(timeout=15)
         self.notif_telegram_last_messages = {}
         self.notif_telegram_update_messages = collections.defaultdict(lambda: dict())
 
         self.status_thread = None
         self.status_thread_last_check = 0
-        self.status_thread_check_interval = 1.5
+        self.status_thread_check_interval = 2.0
         self.main_loop = None
         self.start_error = None
 
@@ -200,13 +201,16 @@ class UpsMonit:
             return
 
         try:
+            is_yml = self.args.config.endswith('.yml') or self.args.config.endswith('.yaml')
             with open(self.args.config) as fh:
-                dt = fh.read()
-                self.config = json.loads(dt)
+                self.config = yaml.safe_load(fh) if is_yml else json.load(fh)
 
             bot_apikey = jsonpath('$.bot_apikey', self.config, True)
             if not self.notifier_telegram.bot_apikey:
                 self.notifier_telegram.bot_apikey = bot_apikey
+
+            bot_enabled = coalesce(jsonpath('$.bot_enabled', self.config, True), True)
+            self.notifier_telegram.disabled = not bot_enabled
 
             jwt_key = jsonpath('$.jwt_key', self.config, True) or 'default-jwt-key-0x043719de'
             if not self.jwt_key:
@@ -428,15 +432,22 @@ class UpsMonit:
                 await self.main_loop.run_in_executor(None, self.start_fifo_comm)
             if self.use_server:
                 await self.main_loop.run_in_executor(None, self.start_server)
-            await self.start_bot_async()
+
+            try:
+                await self.start_bot_async()
+            except Exception as e:
+                self.notifier_telegram.disabled = True
+                logger.error(f'Could not start telegram bot: {e}')
 
             if self.start_error:
                 logger.error(f'Cannot continue, start error: {self.start_error}')
                 raise self.start_error
 
+            logger.info('Starting main handler')
             r = await self.main_handler()
 
         finally:
+            logger.info('Shutting down async main')
             if self.use_fifo:
                 await self.main_loop.run_in_executor(None, try_fnc, lambda: self.fifo_comm.stop())
             if self.use_server:
@@ -552,6 +563,8 @@ class UpsMonit:
             to_edit[chat_id] = last_state_msg.msg
 
         msgs = await self.notifier_telegram.send_telegram_notif(notif, to_edit)
+        if not msgs:
+            return
 
         self.update_last_telegram_messages(msgs, state_key)
         for chat_id in msgs:
@@ -564,7 +577,7 @@ class UpsMonit:
         self.update_last_telegram_messages(msgs)
 
     def update_last_telegram_messages(self, msgs, state_key=None):
-        for chat_id in msgs:
+        for chat_id in (msgs or []):
             self.notif_telegram_last_messages[chat_id] = TelegramNotifMsg(msgs[chat_id], state_key, time.time())
 
     def send_telegram_notif_on_main(self, notif):
