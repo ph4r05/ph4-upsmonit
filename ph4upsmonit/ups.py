@@ -13,10 +13,15 @@ import re
 import signal
 import threading
 import time
+import sys
 from datetime import datetime
 from functools import partial
 from operator import is_not
 from typing import List
+
+# Workaround for telnetlib removal since 3.12
+import telnetlib3
+sys.modules['telnetlib'] = telnetlib3
 
 import coloredlogs
 import jwt

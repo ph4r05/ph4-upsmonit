@@ -18,6 +18,7 @@ install_requires = [
     'PyJWT==2.6.0',
     'ph4-monitlib>=0.0.5',
     'nut2',
+    'telnetlib3',
 ]
 
 dev_extras = [
