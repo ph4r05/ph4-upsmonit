@@ -24,6 +24,7 @@ import yaml
 from nut2 import PyNUTClient
 from ph4monitlib import coalesce, defvalkey, get_runner, jsonpath, try_fnc
 from ph4monitlib.comm import FiFoComm, TcpComm
+from ph4monitlib.mute import Mute
 from ph4monitlib.notif import NotifyEmail
 from ph4monitlib.tbot import TelegramBot
 from ph4monitlib.worker import AsyncWorker, Worker
@@ -161,6 +162,8 @@ class UpsMonit:
 
         self.ups_statuses = collections.defaultdict(lambda: UpsState())
         self.nut_clients = collections.defaultdict(lambda: None)
+        self.mute_email = Mute()
+        self.mute_telegram = Mute()
 
     def argparser(self):
         parser = argparse.ArgumentParser(description="UPS monitoring")
@@ -284,6 +287,10 @@ class UpsMonit:
             "/log - log of latest events",
             "/noemail - disable email reporting",
             "/doemail - enable email reporting",
+            "/mute-mail <time> - mute bot for <time> seconds. ",
+            "/unmute-email - unmute bot, if it was muted. ",
+            "/mute-tel <time> - mute bot for <time> seconds. ",
+            "/unmute-tel - unmute bot, if it was muted. ",
             "/doedit <time> - edit last status message instead of sending a new one. Time to edit the old message in "
             "seconds. ",
         ]
@@ -294,6 +301,11 @@ class UpsMonit:
         noemail_handler = CommandHandler("noemail", self.bot_cmd_noemail)
         doemail_handler = CommandHandler("doemail", self.bot_cmd_doemail)
         doedit_handler = CommandHandler("doedit", self.bot_cmd_doedit)
+        mute_email_handler = CommandHandler("mute_email", self.bot_cmd_mute_email)
+        unmute_email_handler = CommandHandler("unmute_email", self.bot_cmd_unmute_email)
+        mute_telegram_handler = CommandHandler("mute_tel", self.bot_cmd_mute_telegram)
+        unmute_telegram_handler = CommandHandler("unmute_tel", self.bot_cmd_unmute_telegram)
+
         self.notifier_telegram.add_handlers(
             [
                 status_handler,
@@ -302,6 +314,10 @@ class UpsMonit:
                 noemail_handler,
                 doemail_handler,
                 doedit_handler,
+                mute_email_handler,
+                unmute_email_handler,
+                mute_telegram_handler,
+                unmute_telegram_handler,
             ]
         )
 
@@ -466,7 +482,8 @@ class UpsMonit:
             acc = []
             for ups in self.get_ups_names():
                 st = self.get_ups_state(ups)
-                r = self.shorten_status(st.last_ups_status)
+                r = dict(st.last_ups_status or {})
+                r = self.shorten_status(r)
                 r["meta.status_age"] = time.time() - st.last_ups_status_time
                 acc.append(r)
 
@@ -529,12 +546,63 @@ class UpsMonit:
                 return
 
             try:
-                cmd_rest = update.message.text.split(" ", 1)
+                if update.message is None:
+                    return
+                msg = update.message.text or ""
+                cmd_rest = msg.split(" ", 1)
                 self.notif_telegram_edit_time = float(cmd_rest[1])
                 await hlp.reply_msg(f"OK: {self.notif_telegram_edit_time}")
 
             except Exception as e:
                 await hlp.reply_msg(f"Fail: {e}")
+
+    async def bot_cmd_mute_email(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        async with self.notifier_telegram.handler_helper("mute_email", update, context) as hlp:
+            if not hlp.auth_ok:
+                return
+
+            try:
+                if update.message is None:
+                    return
+                msg = update.message.text or ""
+                cmd_rest = msg.split(" ", 1)
+                self.mute_email.mute(cmd_rest[1])
+                await hlp.reply_msg(f"OK: {cmd_rest}")
+
+            except Exception as e:
+                await hlp.reply_msg(f"Fail: {e}")
+
+    async def bot_cmd_unmute_email(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        async with self.notifier_telegram.handler_helper("unmute_email", update, context) as hlp:
+            if not hlp.auth_ok:
+                return
+
+            self.mute_email.unmute()
+            await hlp.reply_msg("OK: unmuted email notifications")
+
+    async def bot_cmd_mute_telegram(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        async with self.notifier_telegram.handler_helper("mute_tel", update, context) as hlp:
+            if not hlp.auth_ok:
+                return
+
+            try:
+                if update.message is None:
+                    return
+                msg = update.message.text or ""
+                cmd_rest = msg.split(" ", 1)
+                self.mute_telegram.mute(cmd_rest[1])
+                await hlp.reply_msg(f"OK: {cmd_rest}")
+
+            except Exception as e:
+                await hlp.reply_msg(f"Fail: {e}")
+
+    async def bot_cmd_unmute_telegram(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        async with self.notifier_telegram.handler_helper("unmute_tel", update, context) as hlp:
+            if not hlp.auth_ok:
+                return
+
+            self.mute_telegram.unmute()
+            await hlp.reply_msg("OK: unmuted telegram notifications")
 
     async def event_handler(self):
         notif_type = os.getenv("NOTIFYTYPE")
@@ -778,6 +846,9 @@ class UpsMonit:
         if not self.email_notif_recipients:
             return
         if not self.do_email_reports:
+            return
+        if self.mute_email.is_muted():
+            logger.info(f"Email notifications are muted for {self.mute_email}")
             return
         return self.send_notify_email(self.email_notif_recipients, txt_message, subject)
 
