@@ -156,6 +156,7 @@ class UpsMonit:
         self.do_email_reports = True
         self.notif_telegram_edit_time = 5 * 60
         self.last_cmd_status = 0
+        self.start_time = 0
 
         self.event_log_deque = collections.deque([], 5_000)
         self.log_report_len = 7
@@ -266,9 +267,15 @@ class UpsMonit:
 
     def _stop_app_on_signal(self):
         logger.info("Signal received")
+        self._stop()
+
+    def _stop(self):
         self.is_running = False
         self.asyncWorker.stop()
         self.worker.stop()
+
+    async def astop(self):
+        self._stop()
 
     def get_ups_state(self, ups_name) -> UpsState:
         return self.ups_statuses[ups_name]
@@ -287,7 +294,7 @@ class UpsMonit:
             "/log - log of latest events",
             "/noemail - disable email reporting",
             "/doemail - enable email reporting",
-            "/mute-mail <time> - mute bot for <time> seconds. ",
+            "/mute-email <time> - mute bot for <time> seconds. ",
             "/unmute-email - unmute bot, if it was muted. ",
             "/mute-tel <time> - mute bot for <time> seconds. ",
             "/unmute-tel - unmute bot, if it was muted. ",
@@ -305,6 +312,7 @@ class UpsMonit:
         unmute_email_handler = CommandHandler("unmute_email", self.bot_cmd_unmute_email)
         mute_telegram_handler = CommandHandler("mute_tel", self.bot_cmd_mute_telegram)
         unmute_telegram_handler = CommandHandler("unmute_tel", self.bot_cmd_unmute_telegram)
+        restart_handler = CommandHandler("restart", self.bot_cmd_restart_telegram)
 
         self.notifier_telegram.add_handlers(
             [
@@ -318,6 +326,7 @@ class UpsMonit:
                 unmute_email_handler,
                 mute_telegram_handler,
                 unmute_telegram_handler,
+                restart_handler,
             ]
         )
 
@@ -430,6 +439,7 @@ class UpsMonit:
         # self.main_loop.set_debug(True)
         self.main_loop.run_until_complete(self.main_async())
         self.is_running = False
+        logger.info("Main loop finished, stopping worker threads")
 
     async def main_async(self):
         logger.info("Async main started")
@@ -460,18 +470,22 @@ class UpsMonit:
                 logger.error(f"Cannot continue, start error: {self.start_error}")
                 raise self.start_error
 
+            self.start_time = time.time()
             logger.info("Starting main handler")
             r = await self.main_handler()
 
         finally:
             logger.info("Shutting down async main")
-            if self.use_fifo:
-                await self.main_loop.run_in_executor(None, try_fnc, lambda: self.fifo_comm.stop())
-            if self.use_server:
-                await self.main_loop.run_in_executor(None, try_fnc, lambda: self.stop_server())
+            await self.astop_comms()
             await self.stop_bot()
 
         return r
+
+    async def astop_comms(self):
+        if self.use_fifo:
+            await self.main_loop.run_in_executor(None, try_fnc, lambda: self.fifo_comm.stop())
+        if self.use_server:
+            await self.main_loop.run_in_executor(None, try_fnc, lambda: self.stop_server())
 
     async def bot_cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with self.notifier_telegram.handler_helper("status", update, context) as hlp:
@@ -603,6 +617,18 @@ class UpsMonit:
 
             self.mute_telegram.unmute()
             await hlp.reply_msg("OK: unmuted telegram notifications")
+
+    async def bot_cmd_restart_telegram(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        async with self.notifier_telegram.handler_helper("restart", update, context) as hlp:
+            if not hlp.auth_ok:
+                return
+
+            if time.time() - (self.start_time or 0) <= 60:
+                await hlp.reply_msg("Too soon after the start, please wait a bit")
+                return
+
+            await hlp.reply_msg("Restarting...")
+            self.asyncWorker.enqueue_on_main(self.astop(), self.main_loop)
 
     async def event_handler(self):
         notif_type = os.getenv("NOTIFYTYPE")
