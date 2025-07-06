@@ -24,7 +24,7 @@ repos:
     hooks:
         -   id: mypy
             name: mypy
-            entry: /bin/bash -c "PATH=\"venv/bin:$PATH\" MYPYPATH=\"ph4_esp32/\" mypy --ignore-missing-imports $*"
+            entry: /bin/bash -c "PATH=\"venv/bin:$PATH\" MYPYPATH=\"ph4upsmonit/\" mypy --ignore-missing-imports $*"
             files: "^ph4upsmonit/"
             types: [file, python]
             language: system
